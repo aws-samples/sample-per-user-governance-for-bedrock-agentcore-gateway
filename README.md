@@ -286,6 +286,16 @@ A budget, a block, or an allowlist can be changed with no deploy and no approval
 step. Restrict who can write to the table, and log those writes, before using
 this in production.
 
+### Security linting
+
+Both CDK apps run [cdk-nag](https://github.com/cdklabs/cdk-nag)
+(`AwsSolutionsChecks`) on every synth, so `npx cdk synth` fails when a new
+resource regresses. Where a finding is accepted rather than fixed, the reason is
+recorded in `nag-suppressions.ts` and pinned to the specific resource and
+finding, and a suppression whose target no longer exists fails synth. The
+accepted items and the reasoning for each are in
+[`infra/README.md`](infra/README.md) and [`app/README.md`](app/README.md).
+
 Report a security issue through the process in
 [CONTRIBUTING](CONTRIBUTING.md#security-issue-notifications) rather than a public
 GitHub issue.
@@ -317,20 +327,6 @@ GitHub issue.
 - **The Cognito pool is demo-sized.** It has no MFA and an 8-character minimum
   password, so that a first user can be created in one command. For anything
   beyond a demo, supply your own OIDC issuer through the `oidc` prop.
-
-## Production hardening
-
-Both CDK apps run [cdk-nag](https://github.com/cdklabs/cdk-nag)
-(`AwsSolutionsChecks`) on every synth, so `npx cdk synth` fails when a new
-resource regresses. Where a finding is accepted rather than fixed, the reason is
-recorded in `nag-suppressions.ts` and pinned to the specific resource and
-finding. A suppression whose target no longer exists causes synth to fail.
-
-The gateway-side items that remain accepted, and what to do about each in a real
-deployment, are in [`infra/README.md`](infra/README.md): the `bedrock-mantle` IAM
-grant scoped by action rather than resource, log retention and KMS, removal
-policies, and the demo-sized budget and rate-limit defaults. The demo app's own
-items are in [`app/README.md`](app/README.md).
 
 ## Optional: demo web app
 

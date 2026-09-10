@@ -54,7 +54,7 @@ export function applyNagSuppressions(stack: Stack): void {
       {
         id: "AwsSolutions-CFR4",
         reason:
-          "The distribution serves the default *.cloudfront.net domain, and the cdk-nag rule reports any distribution using the default CloudFront certificate as non-compliant because its security policy is fixed at TLSv1 whatever MinimumProtocolVersion says. aws-cdk-lib agrees and ignores the prop without a certificate (warning @aws-cdk/aws-cloudfront:minimumProtocolVersionWithoutCertificate). Raising the floor requires a custom domain and an ACM certificate, which a sample cannot assume; the README production hardening section says so. Viewer connections are still redirected to HTTPS.",
+          "The distribution serves the default *.cloudfront.net domain, and the cdk-nag rule reports any distribution using the default CloudFront certificate as non-compliant because its security policy is fixed at TLSv1 whatever MinimumProtocolVersion says. aws-cdk-lib agrees and ignores the prop without a certificate (warning @aws-cdk/aws-cloudfront:minimumProtocolVersionWithoutCertificate). Raising the floor requires a custom domain and an ACM certificate, which a sample cannot assume. Viewer connections are still redirected to HTTPS.",
       },
       {
         id: "AwsSolutions-CFR1",
@@ -64,7 +64,7 @@ export function applyNagSuppressions(stack: Stack): void {
       {
         id: "AwsSolutions-CFR2",
         reason:
-          "No WAF web ACL is attached. The distribution serves a static bundle from an origin-access-control S3 origin, so there is no application-layer surface behind it: every governed call goes to the HTTP API, where a Cognito JWT authorizer runs before any handler, or straight to the AgentCore Gateway. A production deployment should attach a web ACL; the README production hardening section says so.",
+          "No WAF web ACL is attached. The distribution serves a static bundle from an origin-access-control S3 origin, so there is no application-layer surface behind it: every governed call goes to the HTTP API, where a Cognito JWT authorizer runs before any handler, or straight to the AgentCore Gateway. A production deployment should attach a web ACL.",
       },
     ]
   );

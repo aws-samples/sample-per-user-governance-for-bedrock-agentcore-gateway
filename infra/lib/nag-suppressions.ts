@@ -170,7 +170,7 @@ export function applyNagSuppressions(stack: Stack): void {
       {
         id: 'AwsSolutions-COG2',
         reason:
-          'The pool exists to issue JWTs to non-interactive demo clients through admin-initiate-auth, which cannot satisfy an MFA challenge. Sign-up is disabled, there is no hosted UI or user pool domain, the pool is on the Plus feature plan, and the README states that a real deployment should bring its own OIDC issuer through the oidc prop instead of using this pool. See the Responsible AI and production hardening sections of the README.',
+          'The pool exists to issue JWTs to non-interactive demo clients through admin-initiate-auth, which cannot satisfy an MFA challenge. Sign-up is disabled, there is no hosted UI or user pool domain, the pool is on the Plus feature plan, and the README states that a real deployment should bring its own OIDC issuer through the oidc prop instead of using this pool. See the Security and responsible AI and Known limitations sections of the README.',
       },
     ],
   );
