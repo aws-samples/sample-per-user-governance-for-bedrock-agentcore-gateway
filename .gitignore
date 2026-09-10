@@ -1,0 +1,77 @@
+# Build output
+node_modules/
+cdk.out/
+cdk.context.json
+dist/
+build/
+__pycache__/
+*.pyc
+*.tsbuildinfo
+.aws-sam/
+
+# Caches
+.pytest_cache/
+.benchmarks/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Local environment
+.venv/
+venv/
+.env
+.env.*
+*.log
+.DS_Store
+.idea/
+.vscode/
+*.swp
+*~
+
+# Key material and credentials. Nothing in this sample needs one committed:
+# the demo password is generated at deploy time and printed once, and every
+# AWS call uses the deployer's ambient credentials.
+*.pem
+*.key
+*.p12
+*.pfx
+*.jks
+*.keystore
+id_rsa
+id_ed25519
+credentials
+credentials.json
+secrets.json
+*.tfvars
+
+# AI assistant configuration
+.claude/
+.kiro/
+.cursor/
+.codex/
+.gemini/
+.aider*
+.mcp.json
+CLAUDE.md
+AGENTS.md
+GEMINI.md
+QWEN.md
+.cursorrules
+.windsurfrules
+.clinerules
+.github/copilot-instructions.md
+
+# Local notes. This is a blanket ignore: to publish documentation, put it
+# under a different path or add a negation here for it.
+docs/
+PUBLISHING.md
+
+# Tests
+tests/
+test_*.py
+*_test.py
+*.test.ts
+*.test.tsx
+*.spec.ts
+conftest.py

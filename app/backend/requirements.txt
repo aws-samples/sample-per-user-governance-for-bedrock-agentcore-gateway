@@ -1,0 +1,2 @@
+# The Lambda runs no agents; chat goes browser -> AgentCore Runtime -> gateway.
+# boto3 is provided by the Lambda runtime and is not listed here.

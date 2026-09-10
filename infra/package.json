@@ -1,0 +1,26 @@
+{
+  "name": "governance-gateway-infra",
+  "version": "0.1.0",
+  "private": true,
+  "license": "MIT-0",
+  "description": "CDK app for per-user governance on Amazon Bedrock AgentCore Gateway",
+  "bin": {
+    "governance-gateway-infra": "bin/app.js"
+  },
+  "scripts": {
+    "build": "tsc",
+    "synth": "cdk synth",
+    "check": "ts-node scripts/check-synth.ts"
+  },
+  "dependencies": {
+    "aws-cdk-lib": "2.266.0",
+    "constructs": "10.8.1"
+  },
+  "devDependencies": {
+    "@types/node": "22.15.2",
+    "aws-cdk": "2.1138.0",
+    "cdk-nag": "2.38.2",
+    "ts-node": "10.9.2",
+    "typescript": "5.8.3"
+  }
+}
