@@ -223,6 +223,42 @@ try {
 }
 check('guardrailId without guardrailVersion is rejected', halfGuardrailRejected);
 
+// --- A second copy in the same account and region -----------------------------
+// Every name this app chooses that AWS scopes to the account and region has to
+// carry -c nameSuffix, or the second copy fails mid-create on an
+// already-exists error. This walks the suffixed template for literal name
+// properties instead of naming the resources, so a name added later is covered
+// without touching this check.
+console.log('suffixed configuration (a second copy beside an existing one):');
+const SUFFIX = 'copy2';
+const suffixApp = new App({ context: { nameSuffix: SUFFIX } });
+const suffixStack = new GovernanceStack(suffixApp, `AgentCoreGovernanceSample-${SUFFIX}`);
+applyNagSuppressions(suffixStack);
+const suffixTemplate = Template.fromStack(suffixStack);
+
+// Shared on purpose: Bedrock invocation logging is an account-level, per-region
+// singleton, so the second copy reuses the group rather than renaming it
+// (deploy.sh --reuse-logging).
+const SHARED_NAMES = ['/bedrock/invocation-logs'];
+// Names AWS scopes to their parent rather than to the account: an inline policy
+// is unique within its role, a gateway target within its gateway. Two copies
+// can carry the same value without colliding.
+const PARENT_SCOPED_KEYS = ['PolicyName', 'TargetName'];
+const literalNames: string[] = [];
+for (const resource of Object.values(suffixTemplate.toJSON().Resources ?? {}) as any[]) {
+  for (const [key, value] of Object.entries(resource.Properties ?? {})) {
+    if (PARENT_SCOPED_KEYS.includes(key)) continue;
+    if (/Name$/.test(key) && typeof value === 'string' && !SHARED_NAMES.includes(value)) {
+      literalNames.push(`${resource.Type} ${key}=${value}`);
+    }
+  }
+}
+const unsuffixed = literalNames.filter((entry) => !entry.includes(SUFFIX));
+check('every literal name in the suffixed synth carries the suffix',
+  unsuffixed.length === 0, unsuffixed.join('; '));
+check('the suffixed synth names the gateway and the saved queries',
+  literalNames.length >= 4, literalNames.join('; '));
+
 void NagSuppressions;
 console.log(failures === 0 ? '\nall synth checks passed' : `\n${failures} synth check(s) failed`);
 process.exit(failures === 0 ? 0 : 1);

@@ -171,12 +171,14 @@ export interface GovernanceGatewayProps {
   readonly defaultRateLimitPerMinute?: number;
 
   /**
-   * Name for the created gateway. Gateway names are unique per account and
-   * region, so a second copy of this construct in the same region must set
-   * its own (the stack derives one from the -c nameSuffix context value).
-   * @default 'per-user-governance'
+   * Suffix appended to every name this construct picks that AWS scopes to the
+   * account and region: the gateway (`per-user-governance-<s>`) and the saved
+   * Logs Insights queries (`governance/decisions-per-user-<s>`). A second copy
+   * of this construct in the same region must set it, or those creates fail as
+   * already-existing. The stack reads it from the -c nameSuffix context value.
+   * @default none, names are unsuffixed
    */
-  readonly gatewayName?: string;
+  readonly nameSuffix?: string;
 
   /**
    * CloudWatch log group name that Bedrock model invocation logs land in.
@@ -265,9 +267,13 @@ export class GovernanceGateway extends Construct {
   public bedrockLoggingRole?: iam.Role;
   /** ARN of the role the account-level Bedrock logging configuration references. */
   public bedrockLoggingRoleArn?: string;
+  /** '-<nameSuffix>' or '', appended to the account-scoped names we choose. */
+  private readonly suffix: string;
 
   constructor(scope: Construct, id: string, props: GovernanceGatewayProps = {}) {
     super(scope, id);
+
+    this.suffix = props.nameSuffix ? `-${props.nameSuffix}` : '';
 
     if (props.existingGatewayId && props.oidc) {
       throw new Error(
@@ -495,7 +501,7 @@ export class GovernanceGateway extends Construct {
     // CfnGateway and creates the role explicitly. The trust policy mirrors what
     // the L2 built: bedrock-agentcore may assume it, scoped by account and by
     // gateway-ARN prefix on the gateway name.
-    const gatewayName = props.gatewayName ?? 'per-user-governance';
+    const gatewayName = `per-user-governance${this.suffix}`;
     const gatewayRole = new iam.Role(this, 'GatewayServiceRole', {
       assumedBy: new iam.ServicePrincipal('bedrock-agentcore.amazonaws.com', {
         conditions: {
@@ -1076,8 +1082,11 @@ export class GovernanceGateway extends Construct {
     // including refusals that never reached a model); the invocation log is
     // what Bedrock actually SERVED (token counts, stamped with the identity
     // the interceptor injected -- downgrade replays included).
+    //
+    // Saved query names are unique per account and region, so they carry the
+    // deployment suffix; without it a second copy fails to create.
     new logs.CfnQueryDefinition(this, 'QueryDecisionsPerUser', {
-      name: 'governance/decisions-per-user',
+      name: `governance/decisions-per-user${this.suffix}`,
       logGroupNames: [this.logGroup.logGroupName],
       queryString: [
         'fields @timestamp, user_id, action, model, effective_model, error_type',
@@ -1087,7 +1096,7 @@ export class GovernanceGateway extends Construct {
       ].join('\n'),
     });
     new logs.CfnQueryDefinition(this, 'QueryTokensPerUser', {
-      name: 'governance/tokens-per-user',
+      name: `governance/tokens-per-user${this.suffix}`,
       logGroupNames: [invocationLogGroupName],
       queryString: [
         'fields requestMetadata.user as user',
@@ -1101,7 +1110,7 @@ export class GovernanceGateway extends Construct {
       ].join('\n'),
     });
     new logs.CfnQueryDefinition(this, 'QueryModelsPerUser', {
-      name: 'governance/models-per-user',
+      name: `governance/models-per-user${this.suffix}`,
       logGroupNames: [invocationLogGroupName],
       queryString: [
         'fields requestMetadata.user as user, modelId',

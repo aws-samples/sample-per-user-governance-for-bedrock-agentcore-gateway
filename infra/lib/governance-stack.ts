@@ -64,13 +64,14 @@ export class GovernanceStack extends Stack {
         'guardrailId and guardrailVersion must be set together: pass -c guardrailId=<id> -c guardrailVersion=<version>',
       );
     }
-    // Gateway names are unique per account and region, so a second copy of
-    // this stack needs its own. bin/app.ts validates the suffix and applies
-    // the same one to the stack name.
+    // The gateway name and the saved Logs Insights query names are unique per
+    // account and region, so a second copy of this stack needs its own.
+    // bin/app.ts validates the suffix and applies the same one to the stack
+    // name.
     const nameSuffix = this.node.tryGetContext('nameSuffix') as string | undefined;
 
     const governance = new GovernanceGateway(this, 'Governance', {
-      gatewayName: nameSuffix ? `per-user-governance-${nameSuffix}` : undefined,
+      nameSuffix,
       budgetWindow,
       activeHours,
       activeHoursTz,

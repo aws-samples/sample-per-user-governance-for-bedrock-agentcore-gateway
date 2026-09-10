@@ -50,8 +50,9 @@ available (for example, us-east-1).
 Nothing in this stack is inherently one-per-region except its names. Pass
 `--suffix <s>` (letters, digits, hyphens, up to 20 characters) and the deploy
 creates an independent copy: the stack becomes
-`AgentCoreGovernanceSample-<s>`, the gateway `per-user-governance-<s>`, and the
-demo user's mantle project `governance-demo-user-<s>`. Every other resource is
+`AgentCoreGovernanceSample-<s>`, the gateway `per-user-governance-<s>`, the
+saved Logs Insights queries `governance/<query>-<s>`, and the demo user's
+mantle project `governance-demo-user-<s>`. Every other resource is
 CloudFormation-named and never collided.
 
 ```bash
@@ -309,13 +310,14 @@ See `../recipes/` for runnable client examples and the policy item shape.
 
 ## Checks
 
-`npm run check` synthesizes both configurations of the construct and asserts
-four invariants: that `iam:PassRole` and the `bedrock-mantle` actions stay
+`npm run check` synthesizes every configuration of the construct and asserts
+five invariants: that `iam:PassRole` and the `bedrock-mantle` actions stay
 scoped, that every function is on the Python runtime cdk-nag's AwsSolutions-L1
 rule expects, that `existingGatewayId` without `existingGatewayRoleArn` is
-rejected at synth, and that the guardrail context reaches the interceptor's
-environment. It exits non-zero on the first failed assertion. No AWS access
-needed.
+rejected at synth, that the guardrail context reaches the interceptor's
+environment, and that a `-c nameSuffix` synth leaves no account-scoped name
+unsuffixed (the check that a second copy in one region can be created). It
+prints every result and exits non-zero if any failed. No AWS access needed.
 
 ```bash
 cd infra
