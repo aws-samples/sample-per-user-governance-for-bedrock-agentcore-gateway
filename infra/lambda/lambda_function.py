@@ -26,6 +26,28 @@ from typing import Any, Callable, Mapping, Protocol
 
 
 import window as _window
+# B3 Allowed Set (feature F2): pure, boto3-free catalog + Stage-4 enforcement
+# logic (is_routable / resolve_alias). Kept in a sibling module so the decision
+# is unit-testable in isolation; see tests/unit/test_allowed_set.py.
+import allowed_set as _allowed_set
+# B4 USD Quota (feature F3): pure, boto3-free pricing rate sheet + USD
+# reservation/would-exceed math. Kept in sibling modules so the CP-3 Stage-8
+# pre-flight USD estimate is unit-testable in isolation; see
+# tests/unit/test_pricing.py and tests/unit/test_usd_quota.py.
+import pricing as _pricing
+import usd_quota as _usd_quota
+# B7 Content Detectors (feature F4): pure, boto3-free deterministic detectors
+# (PII/credentials/injection/URL-host) + the content-walk. Kept in a sibling
+# module so the CP-3 Stage-5 decision is unit-testable in isolation; see
+# tests/unit/test_detectors.py. Stage 5 is a NON-OPTIONAL global stage
+# (REQ-SEC-028) wired below between entitlement (Stage 4) and quota/route.
+import detectors as _detectors
+# B6 Error Envelopes (feature F5): pure, boto3-free surface-aware error
+# renderer. Renders every gateway error (GovernanceError) in the OpenAI or
+# Anthropic wire shape of the surface the client called (REQ-API-008). Kept in
+# a sibling module so the wire contract is unit-testable in isolation; see
+# tests/unit/test_envelopes.py. Wired into _error_output below.
+import envelopes as _envelopes
 
 _BEDROCK_REGION = os.environ.get("AWS_REGION", "us-east-1")
 # Leave 10 seconds of headroom below the Lambda timeout so we can catch
@@ -479,6 +501,104 @@ def _invoke_stream_body(resp: Mapping[str, Any]) -> bytes:
     )
 
 
+def _guardrail_reason_from_assessments(assessments: list) -> str:
+    """Summarize the first tripped guardrail policy into a stable, specific
+    reason token, without echoing the offending content back to the caller.
+
+    Pure (no AWS): takes the ``assessments`` list from an ApplyGuardrail
+    GUARDRAIL_INTERVENED response and returns the most specific reason it can
+    find. Precedence per assessment: a denied topic (topicPolicy.topics) is the
+    most user-actionable, so it is named as ``topic:<Name>`` (e.g.
+    ``topic:Politics``); then a content-policy filter (e.g. PROMPT_ATTACK ->
+    ``prompt_attack``); then PII (sensitiveInformationPolicy.piiEntities ->
+    ``sensitive_information``). Falls back to ``content_policy`` when an
+    intervention carried no recognizable detail. The returned token is lower
+    kept free of CR/LF so it is safe in a header/JSON error and a stable audit
+    key in CloudWatch.
+    """
+    reason = "content_policy"
+    for assessment in assessments or []:
+        if not isinstance(assessment, dict):
+            continue
+        # 1) Denied topic (Politics/Religion/Terrorism/...). Most specific and
+        # most user-actionable, so it wins within an assessment.
+        topics = (assessment.get("topicPolicy", {}) or {}).get("topics", [])
+        for topic in topics or []:
+            if not isinstance(topic, dict):
+                continue
+            if str(topic.get("action", "BLOCKED")).upper() == "BLOCKED":
+                name = str(topic.get("name", "")).strip()
+                # Bound + strip CR/LF so it is safe in a header/JSON error.
+                name = name.replace("\r", " ").replace("\n", " ")[:64]
+                return f"topic:{name}" if name else "topic"
+        # 2) Content-policy filter (PROMPT_ATTACK, HATE, VIOLENCE, ...).
+        filters = (assessment.get("contentPolicy", {}) or {}).get("filters", [])
+        if filters and isinstance(filters[0], dict):
+            ftype = str(filters[0].get("type", "")).strip().lower()
+            if ftype:
+                # Normalize Bedrock's PROMPT_ATTACK -> prompt_attack (already
+                # lowercased); keep other filter types as their lowercased name.
+                return ftype
+        # 3) Sensitive information (PII).
+        pii = (assessment.get("sensitiveInformationPolicy", {}) or {})
+        if pii.get("piiEntities") or pii.get("regexes"):
+            return "sensitive_information"
+    return reason
+
+
+def _human_guardrail_message(reason: str | None) -> str:
+    """Map a guardrail reason token to a bounded, human-readable, CR/LF-free
+    sentence explaining WHY the request was blocked, so a blocked user can
+    self-correct. Never echoes the offending content. Bounded to <= 300 chars
+    so it can safely ride in a header or JSON error field.
+    """
+    r = (reason or "").strip().lower()
+    if r.startswith("topic"):
+        # reason is "topic:Politics" or bare "topic". Recover a display name.
+        name = ""
+        if ":" in r:
+            name = (reason or "").split(":", 1)[1].strip()
+        display = name if name else "restricted subject"
+        msg = (
+            f"Your request was blocked because it involves a restricted topic "
+            f"({display}). Please rephrase without that subject."
+        )
+    elif r in ("pii", "sensitive_information") or "pii" in r:
+        # SHARED RESPONSIBILITY — this branch reports that Bedrock Guardrails
+        # matched a sensitive-information entity. That detection is best-effort
+        # pattern and model matching over the text this gateway sees: it will
+        # miss personal data it does not recognise or that arrives in an
+        # unfamiliar format, and a request that is NOT blocked here has not
+        # been certified free of personal data.
+        #
+        # Reaching this branch is therefore not evidence of HIPAA or GDPR
+        # compliance. Deciding whether those regimes apply, executing a BAA
+        # with AWS before processing PHI, establishing a lawful basis and
+        # honouring data-subject rights, and setting data residency and
+        # retention all remain the customer's responsibility. See
+        # infra/lib/platform/guardrail.ts for the fuller note, including
+        # the implications of model invocation logging recording prompts and
+        # completions.
+        msg = (
+            "Your request was blocked because it appears to contain sensitive "
+            "personal information (e.g. SSN or passport number). Remove it and "
+            "try again."
+        )
+    elif "prompt_attack" in r or "injection" in r or "prompt" in r:
+        msg = (
+            "Your request was blocked because it looked like a prompt-injection "
+            "attempt. Rephrase your question normally."
+        )
+    else:
+        msg = (
+            "Your request was blocked by the content safety policy. Please "
+            "rephrase and try again."
+        )
+    # Defensive bound: strip any CR/LF and cap length (headers/JSON error).
+    msg = msg.replace("\r", " ").replace("\n", " ")
+    return msg[:300]
+
+
 def _apply_guardrail_input(
     guardrail_id: str, guardrail_version: str, text: str
 ) -> tuple[bool, str | None]:
@@ -489,6 +609,12 @@ def _apply_guardrail_input(
     used (Anthropic Messages, Converse, or InvokeModel) and screens it in one
     synchronous call that invokes no model. INPUT source screens the prompt, so
     a blocked request never reaches Bedrock and costs nothing.
+
+    The reason is the most specific tripped policy available -- a denied topic
+    (``topic:<Name>``), a content-policy filter (e.g. ``prompt_attack``), or
+    ``sensitive_information`` for PII -- computed by the pure helper
+    ``_guardrail_reason_from_assessments`` so the mapping is unit-testable
+    without AWS.
     """
     client = _bedrock_client()
     resp = client.apply_guardrail(
@@ -499,19 +625,7 @@ def _apply_guardrail_input(
     )
     if resp.get("action") != "GUARDRAIL_INTERVENED":
         return False, None
-    # Summarize the first tripped policy for the audit record, without echoing
-    # the offending content back to the caller.
-    reason = "content_policy"
-    for assessment in resp.get("assessments", []):
-        content_policy = assessment.get("contentPolicy", {})
-        filters = content_policy.get("filters", [])
-        if filters:
-            reason = str(filters[0].get("type", reason)).lower()
-            break
-        pii = assessment.get("sensitiveInformationPolicy", {})
-        if pii.get("piiEntities"):
-            reason = "sensitive_information"
-            break
+    reason = _guardrail_reason_from_assessments(resp.get("assessments", []))
     return True, reason
 
 OUTPUT_VERSION = "1.0"
@@ -598,9 +712,26 @@ class Policy:
     # its requested model rather than breaking it.
     fallback_model_openai: str = ""
 
+    # ── B4 USD Quota (feature F3) ──────────────────────────────────────────
+    # USD-denominated monthly budget in integer micro-USD (1 USD = 1e6 µ$),
+    # layered ADDITIVELY on top of the sample's token budget: when
+    # budget_micro_usd > 0 (and a rate sheet is configured on the service) the
+    # CP-3 Stage-8 pre-flight USD reservation runs; when it is 0 the interceptor
+    # behaves exactly as the token-only sample (F2 unchanged). REQ-QUOTA-001/003.
+    budget_micro_usd: int = 0
+    # Temporary increase (REQ-QUOTA-004) keyed to a %Y-%m window; auto-expires
+    # at reset because it only applies when temp_increase_period == the current
+    # month bucket (REQ-QUOTA-004A). Resolved by usd_quota.effective_budget.
+    temp_increase_micro_usd: int = 0
+    temp_increase_period: str = ""
+
     def validate(self) -> None:
         if self.budget_tokens < 0:
             raise ValueError("budget_tokens must be non-negative")
+        if self.budget_micro_usd < 0:
+            raise ValueError("budget_micro_usd must be non-negative")
+        if self.temp_increase_micro_usd < 0:
+            raise ValueError("temp_increase_micro_usd must be non-negative")
         if self.rate_limit_per_minute < 0:
             raise ValueError("rate_limit_per_minute must be non-negative")
         if not 0 <= self.downgrade_at_tokens <= self.budget_tokens:
@@ -669,6 +800,11 @@ class Settings:
     # Defaults mirror Anthropic pricing (reads 10%, writes 125%).
     cache_read_weight_pct: int = 10
     cache_write_weight_pct: int = 125
+    # B4 USD Quota (feature F3): the REQ-QUOTA-005A tolerance (percent). The
+    # pre-flight USD reservation admits iff consumed+reserved+estimate <=
+    # budget*(1+budget_headroom_pct/100). Default 1% per config quota block /
+    # ORG#/SETTINGS.budget_headroom_pct.
+    budget_headroom_pct: int = 1
     # TTL on the per-user-per-minute rate counter; a few minutes is enough for
     # the minute bucket to be self-cleaning.
     rate_limit_ttl_seconds: int = 300
@@ -678,6 +814,16 @@ class Settings:
     # disables the safety pillar (the checkpoint still enforces the others).
     guardrail_id: str = ""
     guardrail_version: str = ""
+    # B7 Content Detectors (feature F4) — CP-3 Stage 5, REQ-SEC-019 URL-host
+    # allowlist. When set, every URL referenced anywhere in the request body
+    # (image_url/source/url fields and URLs embedded in text) must resolve to a
+    # host on this list or the request is rejected 403 before any upstream call
+    # (REQ-SEC-019). Empty tuple = no allowlist configured => the URL-host
+    # detector is skipped; the PII/credential/injection detectors ALWAYS run
+    # and cannot be disabled per-key/route (REQ-SEC-028). This is a global
+    # structural knob (it can tighten inspection by adding an allowlist, never
+    # disable Stage 5).
+    url_host_allowlist: tuple[str, ...] = ()
     # Budget window: what "per" means for budget_tokens. Calendar-aligned in
     # UTC (hour/day/week/month); "day" reproduces the original behavior
     # exactly. Changing it re-buckets usage, which forgives spend accumulated
@@ -720,6 +866,10 @@ class Settings:
             fallback_model_openai=os.environ.get(
                 "DEFAULT_FALLBACK_MODEL_OPENAI", ""
             ).strip(),
+            # B4 USD Quota (F3): org-default monthly budget in micro-USD. 0
+            # (default) leaves the USD pre-flight OFF and the token path
+            # untouched; set from config quota.default_quota_usd * 1e6.
+            budget_micro_usd=_env_int("DEFAULT_BUDGET_MICRO_USD", 0, 0),
         )
         default_policy.validate()
         return cls(
@@ -748,8 +898,15 @@ class Settings:
             retry_after_seconds=_env_int("BUDGET_RETRY_AFTER_SECONDS", 60, 1),
             cache_read_weight_pct=_env_int("CACHE_READ_WEIGHT_PCT", 10, 0),
             cache_write_weight_pct=_env_int("CACHE_WRITE_WEIGHT_PCT", 125, 0),
+            budget_headroom_pct=_env_int("BUDGET_HEADROOM_PCT", 1, 0),
             guardrail_id=os.environ.get("GUARDRAIL_ID", "").strip(),
             guardrail_version=os.environ.get("GUARDRAIL_VERSION", "").strip(),
+            # B7 (F4) REQ-SEC-019 URL-host allowlist, comma-separated hosts.
+            url_host_allowlist=tuple(
+                h.strip()
+                for h in os.environ.get("URL_HOST_ALLOWLIST", "").split(",")
+                if h.strip()
+            ),
             budget_window=_env_budget_window(),
             **_env_active_hours(),
         )
@@ -794,6 +951,24 @@ class RequestContext:
     # admission write, self-reported so the demo timeline can show the
     # governance checkpoint's real cost instead of guessing. 0 = not measured.
     interceptor_ms: int = 0
+    # B4 USD Quota (feature F3). The µ$ reservation held at admission and the
+    # pricing basis pinned at admission so settlement can (a) release exactly
+    # this reservation and (b) compute the real USD debit on the SAME rate the
+    # estimate used (design §2.5 step 5 / §2.12 step 2). 0 reservation = USD
+    # quota not enabled for this request (token-only settlement, unchanged).
+    reserved_micro_usd: int = 0
+    rate_input_micro_usd_per_1k: int = 0
+    rate_output_micro_usd_per_1k: int = 0
+    rate_cache_read_micro_usd_per_1k: int = 0
+    rate_cache_write_micro_usd_per_1k: int = 0
+    # Worst-case TOKEN reservation held at admission, released at settlement.
+    # Without it, admission only tested the already-settled debit, so N
+    # concurrent requests from one identity all read the same figure and all
+    # passed: measured 1,044 tokens settled against a 700-token budget (149%),
+    # 15 of 20 admitted. Mirrors reserved_micro_usd above. 0 = no reservation
+    # held (a legacy REQ row written before this field existed), in which case
+    # settlement skips the release and the accumulator still converges.
+    reserved_tokens: int = 0
 
 
 @dataclass(frozen=True)
@@ -832,6 +1007,10 @@ class Repository(Protocol):
 
     def get_usage_debit(self, usage_pk: str) -> int: ...
 
+    def get_usage_committed(self, usage_pk: str) -> int: ...
+
+    def get_usd_ledger(self, usage_pk: str) -> tuple[int, int]: ...
+
     def check_rate_limit(self, user_id: str, limit: int, now: int, ttl: int) -> bool: ...
 
     def get_request(self, request_id: str) -> RequestContext | None: ...
@@ -845,6 +1024,9 @@ class Repository(Protocol):
         *,
         threshold_limit: int | None,
         usage_expires_at: int,
+        reservation_tokens: int = 0,
+        reservation_micro_usd: int | None = None,
+        usd_budget_ceiling_micro_usd: int | None = None,
     ) -> None: ...
 
     def finalize(
@@ -901,6 +1083,15 @@ class DynamoRepository:
             fallback_model_openai=_optional_string(
                 item, "fallback_model_openai", defaults.fallback_model_openai
             ),
+            budget_micro_usd=_optional_int(
+                item, "budget_micro_usd", defaults.budget_micro_usd
+            ),
+            temp_increase_micro_usd=_optional_int(
+                item, "temp_increase_micro_usd", defaults.temp_increase_micro_usd
+            ),
+            temp_increase_period=_optional_string(
+                item, "temp_increase_period", defaults.temp_increase_period
+            ),
         )
         policy.validate()
         return policy
@@ -941,6 +1132,59 @@ class DynamoRepository:
             return 0
         return _number(item["budget_debit_tokens"], "budget_debit_tokens")
 
+    def get_usage_committed(self, usage_pk: str) -> int:
+        """Settled token debits PLUS outstanding reservations for the window.
+
+        Read only to explain a rejected admission: the committed figure is what
+        the condition actually tested, so a request refused while the settled
+        debit is still under budget is correctly reported as over budget rather
+        than misdiagnosed as a conflict. Falls back to the settled debit when
+        the attribute is absent (a USAGE row predating the reservation).
+        """
+        response = self.client.get_item(
+            TableName=self.table_name,
+            Key={"pk": _s(usage_pk)},
+            ConsistentRead=True,
+            ProjectionExpression="token_committed_tokens, budget_debit_tokens",
+        )
+        item = response.get("Item")
+        if not isinstance(item, Mapping):
+            return 0
+        if "token_committed_tokens" in item:
+            return _number(
+                item["token_committed_tokens"], "token_committed_tokens"
+            )
+        if "budget_debit_tokens" in item:
+            return _number(item["budget_debit_tokens"], "budget_debit_tokens")
+        return 0
+
+    def get_usd_ledger(self, usage_pk: str) -> tuple[int, int]:
+        """Return ``(budget_debit_micro_usd, reserved_micro_usd)`` for the
+        window — the settled USD debit and the outstanding reservations (B4,
+        design §2.2). Effective consumption for the admit compare is their sum.
+        A window with no USD activity yet reads as ``(0, 0)`` (a fresh %Y-%m
+        bucket → zero, which IS the monthly reset, REQ-QUOTA-002)."""
+        response = self.client.get_item(
+            TableName=self.table_name,
+            Key={"pk": _s(usage_pk)},
+            ConsistentRead=True,
+            ProjectionExpression="budget_debit_micro_usd, reserved_micro_usd",
+        )
+        item = response.get("Item")
+        if not isinstance(item, Mapping):
+            return (0, 0)
+        debit = (
+            _number(item["budget_debit_micro_usd"], "budget_debit_micro_usd")
+            if "budget_debit_micro_usd" in item
+            else 0
+        )
+        reserved = (
+            _number(item["reserved_micro_usd"], "reserved_micro_usd")
+            if "reserved_micro_usd" in item
+            else 0
+        )
+        return (debit, reserved)
+
     def get_request(self, request_id: str) -> RequestContext | None:
         response = self.client.get_item(
             TableName=self.table_name,
@@ -964,6 +1208,22 @@ class DynamoRepository:
             fingerprint=_string(item, "fingerprint"),
             created_at=_integer(item, "created_at"),
             expires_at=_integer(item, "expires_at"),
+            reserved_micro_usd=_optional_int(item, "reserved_micro_usd", 0),
+            # Default 0 so a REQ row written before this field existed settles
+            # without attempting a release it never made.
+            reserved_tokens=_optional_int(item, "reserved_tokens", 0),
+            rate_input_micro_usd_per_1k=_optional_int(
+                item, "rate_input_micro_usd_per_1k", 0
+            ),
+            rate_output_micro_usd_per_1k=_optional_int(
+                item, "rate_output_micro_usd_per_1k", 0
+            ),
+            rate_cache_read_micro_usd_per_1k=_optional_int(
+                item, "rate_cache_read_micro_usd_per_1k", 0
+            ),
+            rate_cache_write_micro_usd_per_1k=_optional_int(
+                item, "rate_cache_write_micro_usd_per_1k", 0
+            ),
         )
 
     def event_exists(self, request_id: str) -> bool:
@@ -982,16 +1242,43 @@ class DynamoRepository:
         *,
         threshold_limit: int | None,
         usage_expires_at: int,
+        reservation_tokens: int = 0,
+        reservation_micro_usd: int | None = None,
+        usd_budget_ceiling_micro_usd: int | None = None,
     ) -> None:
-        """Admit a request: nothing is debited here, only checked and recorded.
+        """Admit a request: check the budget, reserve against it, record it.
 
-        Admission is the industry pattern (LiteLLM, Kong, Portkey): the request
-        is allowed when the debit ALREADY recorded for this window is under
-        budget, and the actual usage is debited afterwards in `finalize`. So
-        this writes no token amount at all -- it asserts the budget condition,
-        stamps the window's metadata, counts the request, and creates the REQ
-        row, all in one transaction.
+        Admission allows a request when the spend COMMITTED for this window --
+        already settled plus still in flight -- leaves room for this request's
+        worst case. The actual usage is debited afterwards in ``finalize``,
+        which swaps the reservation for the real figure.
+
+        Reserving is what makes the token decision TOCTOU-safe. Testing only
+        the already-settled debit (the industry pattern used by LiteLLM, Kong
+        and Portkey, and what this method did before) lets N concurrent
+        requests from one identity all read the same figure and all pass:
+        measured live, 20 concurrent requests against a 700-token budget
+        admitted 15 and settled 1,044 tokens, a 149% overshoot. DynamoDB
+        re-evaluates a ConditionExpression against the committed item, so
+        moving the test onto a reservation-inclusive accumulator serialises
+        the decision without a lock.
+
+        B4 USD reservation (feature F3): when ``reservation_micro_usd`` and
+        ``usd_budget_ceiling_micro_usd`` are supplied (USD quota enabled), the
+        SAME transaction additionally asserts
+        ``budget_debit_micro_usd + reserved_micro_usd + reservation <= ceiling``
+        and atomically ``ADD``s the reservation to ``reserved_micro_usd``. This
+        is what makes the USD decision TOCTOU-safe: DynamoDB re-evaluates the
+        condition against the committed item, so two concurrent requests from
+        one identity cannot both overspend (design §2.5 step 4). When they are
+        omitted (token-only / F2), the transaction is byte-for-byte the sample's.
         """
+        # The settled-debit test is RETAINED alongside the new committed test.
+        # A USAGE row written before this change carries no
+        # token_committed_tokens, and `attribute_not_exists` would otherwise
+        # read as "nothing committed" and admit a user who had already spent
+        # their whole budget. Keeping both means a legacy row still gets the
+        # old guard while new rows get the race-free one.
         condition = (
             "(attribute_not_exists(#debit) OR #debit <= :budget_limit) "
             "AND (attribute_not_exists(#user_id) OR #user_id = :user_id)"
@@ -1012,27 +1299,75 @@ class DynamoRepository:
                 "#debit <= :threshold_limit)"
             )
             values[":threshold_limit"] = _n(threshold_limit)
+        set_clause = (
+            "SET #user_id = if_not_exists(#user_id, :user_id), "
+            "#usage_date = if_not_exists(#usage_date, :usage_date), "
+            "#item_type = if_not_exists(#item_type, :usage_type), "
+            "#expires_at = :usage_expiry, #budget = :budget, #updated_at = :now "
+        )
+        add_clause = "ADD #accepted :one"
+        names = {
+            "#user_id": "user_id",
+            "#usage_date": "usage_date",
+            "#item_type": "item_type",
+            "#expires_at": "expires_at",
+            "#budget": "budget_tokens",
+            "#updated_at": "updated_at",
+            "#debit": "budget_debit_tokens",
+            "#accepted": "accepted_requests",
+        }
+        # Token ceiling, reservation-inclusive. Same shape as the USD block
+        # below and for the same reason: a ConditionExpression cannot do
+        # arithmetic, so ONE accumulator `token_committed_tokens` carries
+        # (settled debits + outstanding reservations) via ADD, and it is
+        # compared against a Python-precomputed threshold
+        # (budget - this reservation). Equivalent to
+        # committed + reservation <= budget, but legal in a condition.
+        #
+        # A reservation that is never released -- the interceptor dies between
+        # admission and settlement -- leaves the accumulator high and makes the
+        # user's remaining budget smaller than it should be until the window
+        # rolls over. That fails CLOSED, which is the correct direction for a
+        # spend control, and matches the USD path's existing tradeoff.
+        if reservation_tokens > 0:
+            condition += (
+                " AND (attribute_not_exists(#token_committed) OR "
+                "#token_committed <= :token_committed_max)"
+            )
+            add_clause += (
+                ", #token_committed :token_reservation"
+                ", #reserved_tokens :token_reservation"
+            )
+            names["#token_committed"] = "token_committed_tokens"
+            names["#reserved_tokens"] = "reserved_tokens"
+            values[":token_reservation"] = _n(reservation_tokens)
+            values[":token_committed_max"] = _n(
+                policy.budget_tokens - reservation_tokens
+            )
+        # B4: assert the USD ceiling on the committed item and reserve atomically.
+        # DynamoDB ConditionExpressions do NOT permit arithmetic (no `a + b`);
+        # only UpdateExpressions do. So we track ONE combined accumulator
+        # `usd_committed_micro_usd` (debit + reservations, via ADD) and compare
+        # that single attribute against a Python-precomputed threshold
+        # (ceiling - this reservation). Equivalent to
+        # committed + reservation <= ceiling, but legal in a condition.
+        if reservation_micro_usd is not None and usd_budget_ceiling_micro_usd is not None:
+            condition += (
+                " AND (attribute_not_exists(#usd_committed) OR "
+                "#usd_committed <= :usd_committed_max)"
+            )
+            add_clause += ", #usd_committed :reservation"
+            names["#usd_committed"] = "usd_committed_micro_usd"
+            values[":reservation"] = _n(reservation_micro_usd)
+            values[":usd_committed_max"] = _n(
+                usd_budget_ceiling_micro_usd - reservation_micro_usd
+            )
         update_usage = {
             "TableName": self.table_name,
             "Key": {"pk": _s(request_context.usage_pk)},
-            "UpdateExpression": (
-                "SET #user_id = if_not_exists(#user_id, :user_id), "
-                "#usage_date = if_not_exists(#usage_date, :usage_date), "
-                "#item_type = if_not_exists(#item_type, :usage_type), "
-                "#expires_at = :usage_expiry, #budget = :budget, #updated_at = :now "
-                "ADD #accepted :one"
-            ),
+            "UpdateExpression": set_clause + add_clause,
             "ConditionExpression": condition,
-            "ExpressionAttributeNames": {
-                "#user_id": "user_id",
-                "#usage_date": "usage_date",
-                "#item_type": "item_type",
-                "#expires_at": "expires_at",
-                "#budget": "budget_tokens",
-                "#updated_at": "updated_at",
-                "#debit": "budget_debit_tokens",
-                "#accepted": "accepted_requests",
-            },
+            "ExpressionAttributeNames": names,
             "ExpressionAttributeValues": values,
         }
         put_request = {
@@ -1140,6 +1475,60 @@ class DynamoRepository:
         if usage is None:
             names["#released"] = "released_without_usage"
             add_parts.append("#released :one")
+        # Swap the admission token reservation for the real debit in the single
+        # ceiling accumulator: committed += actual - reservation. On a request
+        # that produced no usage (upstream error, timeout) actual is 0, so this
+        # releases the whole reservation and the budget is handed straight back.
+        # The put_event condition makes the transaction exactly-once, so the
+        # release happens exactly once; reserved_tokens goes back to zero via an
+        # ADD of the negative amount, mirroring the positive ADD at admission.
+        if request_context.reserved_tokens > 0:
+            names["#token_committed"] = "token_committed_tokens"
+            names["#reserved_tokens"] = "reserved_tokens"
+            values[":token_committed_delta"] = _n(
+                actual_total - request_context.reserved_tokens
+            )
+            values[":token_release"] = _n(-request_context.reserved_tokens)
+            add_parts.append("#token_committed :token_committed_delta")
+            add_parts.append("#reserved_tokens :token_release")
+        # B4 USD Quota (F3): release the admission reservation and debit the
+        # real USD cost in the SAME transaction (design §2.5 step 5). Guarded on
+        # a reservation having been held (reserved_micro_usd > 0); a token-only
+        # request leaves this block untouched so the sample settlement is
+        # unchanged. Real cost is computed on the rate PINNED at admission (so
+        # true-up matches the estimate's basis, design §2.12 step 2); a
+        # failed/timed-out request (usage is None) debits $0 (REQ-ADMIN-004E)
+        # and releases the reservation. Reservation released via ADD of the
+        # negative amount, mirroring the positive ADD at admission — the
+        # EVENT# idempotency guard (the put_event condition) makes the whole
+        # transaction exactly-once, so the reservation is released exactly once.
+        if request_context.reserved_micro_usd > 0:
+            pinned_rate = _pricing.Rate(
+                input_micro_usd_per_1k=request_context.rate_input_micro_usd_per_1k,
+                output_micro_usd_per_1k=request_context.rate_output_micro_usd_per_1k,
+                cache_read_micro_usd_per_1k=(
+                    request_context.rate_cache_read_micro_usd_per_1k
+                ),
+                cache_write_micro_usd_per_1k=(
+                    request_context.rate_cache_write_micro_usd_per_1k
+                ),
+            )
+            real_cost_micro_usd = (
+                0 if usage is None else _pricing.cost_micro_usd(pinned_rate, recorded.as_dict())
+            )
+            names["#usd_debit"] = "budget_debit_micro_usd"
+            names["#reserved"] = "reserved_micro_usd"
+            names["#usd_committed"] = "usd_committed_micro_usd"
+            values[":usd_debit"] = _n(real_cost_micro_usd)
+            values[":usd_release"] = _n(-request_context.reserved_micro_usd)
+            # Swap the held reservation for the real debit in the single
+            # ceiling accumulator: committed += real_cost - reservation.
+            values[":usd_committed_delta"] = _n(
+                real_cost_micro_usd - request_context.reserved_micro_usd
+            )
+            add_parts.append("#usd_debit :usd_debit")
+            add_parts.append("#reserved :usd_release")
+            add_parts.append("#usd_committed :usd_committed_delta")
         update_usage = {
             "TableName": self.table_name,
             "Key": {"pk": _s(request_context.usage_pk)},
@@ -1214,18 +1603,109 @@ class GovernanceService:
     repository: Repository
     now: Callable[[], float] = time.time
     logger: Callable[[str], None] = print
+    # B3 org-level Model & Provider Allowed Set (feature F2). When configured
+    # (seeded from config.yaml for the demo, or projected from the
+    # ALLOWED#/ORG# DynamoDB items per ARCHITECTURE §3), Stage 4 enforces
+    # entitlement CONSTRAINED TO this catalog (REQ-ADMIN-004/004A/004B/004C).
+    # None preserves the sample's original per-user-only behavior unchanged.
+    allowed_set: "_allowed_set.AllowedSet | None" = None
+    # B4 USD Quota (feature F3). CP-6 rate sheet used by the CP-3 Stage-8
+    # pre-flight USD reservation. None (default) uses pricing.SEED_RATE_SHEET;
+    # the demo can inject a projected RATE_SHEET#CURRENT here. The USD stage
+    # only runs when the resolved policy carries budget_micro_usd > 0, so a
+    # deployment that has not enabled USD quotas is behaviourally unchanged.
+    rate_sheet: "Mapping[str, _pricing.Rate] | None" = None
 
     def handle(self, event: Mapping[str, Any], context: Any) -> dict[str, Any]:
-        # This deployment attaches the interceptor at REQUEST only (see
-        # governance-gateway.ts and attach_interceptor.py) because a RESPONSE
-        # interceptor forces the gateway to buffer streamed replies. The
-        # RESPONSE branch below is therefore unreachable as shipped; it is
-        # retained, with its usage parsers, for operators who deliberately
-        # attach a RESPONSE interceptor to trade streaming for in-band
-        # settlement instead of the async attribution pipeline.
+        # This deployment attaches the interceptor at REQUEST **and** RESPONSE
+        # (see governance-gateway.ts). RESPONSE is what settles the mantle door
+        # per user, and the only thing that can meter the OpenAI-compatible
+        # runtime paths, which carry no request metadata. The cost is that the
+        # gateway buffers streamed replies: measured in us-east-1,
+        # time-to-first-byte equals time-to-last-byte with RESPONSE attached,
+        # against a 0.7s spread without it.
         if _interception_point(event) == "RESPONSE":
             return self._handle_response(event, context)
         return self._handle_request(event, context)
+
+    def _handle_model_listing(
+        self, gateway_request: Any, request_path: str
+    ) -> dict[str, Any]:
+        """Answer a model-discovery request from the caller's entitlement.
+
+        Short-circuits with 200 and the user's allowed models, so a client's
+        model picker lists exactly what that user may actually invoke. Nothing
+        is metered -- no model runs -- but the route is governed: a missing or
+        invalid bearer is 401, and a blocked user is 403.
+
+        Ordering note: the allowed set is intersected with the org catalog when
+        one is configured, the same constraint Stage 4 applies at invocation,
+        so discovery cannot advertise a model the org has withdrawn.
+        """
+        surface = _envelopes.surface_from_path(request_path)
+        try:
+            headers = (
+                gateway_request.get("headers")
+                if isinstance(gateway_request, Mapping)
+                else None
+            )
+            if not isinstance(headers, Mapping):
+                raise GovernanceError(
+                    401, "missing_bearer_token", "Bearer token is required"
+                )
+            user_id = _extract_subject(headers, self.settings)
+            policy = self.repository.get_policy(user_id, self.settings.default_policy)
+            policy.validate()
+            if policy.blocked:
+                raise GovernanceError(
+                    403, "access_denied", "Access denied by user policy"
+                )
+            entitled = policy.allowed_models
+            if entitled is None:
+                # No per-user restriction: fall back to the org catalog when one
+                # is configured, and otherwise return an empty list rather than
+                # inventing a catalog the gateway does not actually know.
+                ids = (
+                    sorted(_allowed_set.routable_ids(self.allowed_set))
+                    if self.allowed_set is not None
+                    else []
+                )
+            else:
+                ids = sorted(entitled)
+                if self.allowed_set is not None:
+                    catalog = _allowed_set.routable_ids(self.allowed_set)
+                    ids = [model_id for model_id in ids if model_id in catalog]
+            self._log(
+                "model_listing",
+                # Discovery creates no REQ row and is not metered, so there is
+                # no governance request id to correlate against.
+                request_id=None,
+                user_id=user_id,
+                action="listed",
+                status_code=200,
+                model_count=len(ids),
+            )
+            raw = json.dumps(
+                _model_listing_body(ids), separators=(",", ":")
+            ).encode("utf-8")
+            return {
+                "interceptorOutputVersion": OUTPUT_VERSION,
+                "http": {"transformedGatewayResponse": {
+                    "statusCode": 200,
+                    "contentType": "application/json",
+                    "body": base64.b64encode(raw).decode("ascii"),
+                }},
+            }
+        except GovernanceError as error:
+            return _error_output(error, None, surface)
+        except Exception:  # noqa: BLE001 -- discovery must fail closed too
+            return _error_output(
+                GovernanceError(
+                    503, "governance_unavailable", "Governance is unavailable"
+                ),
+                None,
+                surface,
+            )
 
     def _handle_request(
         self, event: Mapping[str, Any], context: Any
@@ -1254,14 +1734,53 @@ class GovernanceService:
         gateway_request = (
             http.get("gatewayRequest") if isinstance(http, Mapping) else None
         )
+        request_path = (
+            str(gateway_request.get("path") or gateway_request.get("uri") or "")
+            if isinstance(gateway_request, Mapping)
+            else ""
+        )
+        # Model discovery. Answered HERE rather than passed through, for two
+        # reasons. It used to fall past the guard below and reach
+        # ``_parse_request``, which demands a JSON body and rejected it with
+        # 400 "A base64 body is required" (UAT F18) -- so the route was simply
+        # broken. And a passthrough would return the ACCOUNT's catalog, letting
+        # a client's model picker offer models this user's policy refuses at
+        # invocation. Returning the caller's own entitlement makes discovery
+        # agree with enforcement.
+        #
+        # Matched on the path alone, never on the method or body: ``/v1/models``
+        # is never a model-invoking route, and GET events do not reliably carry
+        # httpMethod -- which is exactly why the guard below did not catch it.
+        # Nothing is metered (no model runs) but the route is still governed:
+        # it requires a valid bearer and refuses a blocked user.
+        if _is_model_listing_path(request_path):
+            return self._handle_model_listing(gateway_request, request_path)
         if isinstance(gateway_request, Mapping):
             method = str(gateway_request.get("httpMethod", "")).upper()
             body = gateway_request.get("body")
             if method != "POST" and not body:
                 return _passthrough_output()
+        # B6 / F5 (REQ-API-008): determine the called surface up front from the
+        # URL path so an error raised BEFORE the body parses (missing bearer,
+        # malformed JSON, 413 body-too-large) is still rendered in the client's
+        # shape. The gateway routes on the path, so the surface is derivable
+        # even pre-parse; an unrecognized path falls back to the Anthropic shape
+        # (the pre-F5 default). After parse succeeds this is refined to ride the
+        # already-computed parsed.openai_format flag rather than re-deriving it.
+        surface = _envelopes.surface_from_path(
+            str(gateway_request.get("path") or gateway_request.get("uri") or "")
+            if isinstance(gateway_request, Mapping)
+            else ""
+        )
         try:
             request_id = _request_id(context, required=True)
             parsed = _parse_request(event, self.settings)
+            # Refine the surface from the parsed request's already-computed
+            # openai_format flag (do not recompute from scratch) so post-parse
+            # rejections render in the correct shape. converse-door requests
+            # (converse_path set) are not openai_format and keep the Anthropic
+            # default shape, unchanged from pre-F5.
+            surface = _envelopes.surface_for(parsed.openai_format)
             user_id = parsed.user_id
             model = parsed.original_model
             policy = self.repository.get_policy(user_id, self.settings.default_policy)
@@ -1272,9 +1791,88 @@ class GovernanceService:
             # turned away before any DynamoDB read. Admission-time only: a
             # request admitted at closing time streams to completion.
             self._check_active_hours(int(self.now()))
+            # ── CP-3 Stage 4: Entitlement ∩ Allowed Set (B1 + B3) ──────────
+            # The sample's per-user allowed_models list is the caller's
+            # entitlement (B1); it is preserved as the first, cheapest check.
+            # REQ-SEC-009 / REQ-ADMIN-004C: a model the caller is not entitled
+            # to is refused here, 403, before any upstream connection.
             if policy.allowed_models is not None and model not in policy.allowed_models:
                 raise GovernanceError(
                     403, "model_not_allowed", "Requested model is not allowed"
+                )
+            # When an org-level Allowed Set catalog is configured, EXTEND the
+            # check with the B3 org catalog: a model is routable only if its
+            # provider is enabled (REQ-ADMIN-004A) AND the model entry is
+            # enabled (REQ-ADMIN-004B) AND the caller is entitled to it
+            # (REQ-ADMIN-004C, entitlement constrained to the Allowed Set).
+            # A stable alias resolves to its pinned model_id (REQ-API-016 /
+            # REQ-SEC-034). Re-checking membership here (not only at grant
+            # time) closes the race where a model is removed/disabled after a
+            # grant while a stale policy still names it. Reject -> 403 with no
+            # upstream call opened (ARCHITECTURE §4 Stage 4).
+            if self.allowed_set is not None:
+                ok, reason, resolved_model_id = _allowed_set.is_routable(
+                    self.allowed_set, model, policy.allowed_models
+                )
+                if not ok:
+                    raise GovernanceError(
+                        403, "model_not_allowed", f"Requested model is not allowed ({reason})"
+                    )
+                # Alias -> pinned upstream id (REQ-API-016 / REQ-SEC-034). The
+                # resolved id is what the request must route to upstream; the
+                # original alias is preserved on the request context for audit.
+                if resolved_model_id and resolved_model_id != model:
+                    model = resolved_model_id
+                    parsed.body["model"] = resolved_model_id
+            # ── CP-3 Stage 5: Content inspection & detectors (B7, feature F4) ─
+            # Runs AFTER entitlement/allowed-set (Stage 4) and BEFORE the rate
+            # limit / control-field / quota / route stages, so a request whose
+            # content trips a high-confidence detector is refused 403 before any
+            # upstream connection opens and spends no tokens (REQ-SEC-014).
+            #
+            # NON-OPTIONAL global stage (REQ-SEC-028): there is no per-key /
+            # per-route flag that disables it — the only structural knob is the
+            # URL-host allowlist (which tightens, never disables). The PII,
+            # credential, and injection detectors always run. Deterministic and
+            # boto3-free, so it enforces even when the logging/alert path is
+            # down (REQ-SEC-015).
+            #
+            # The content-walk enumerates every text/URL node across the
+            # Anthropic Messages shape (messages[].content[] incl. tool_result)
+            # and the OpenAI chat shape, satisfying the inspection surface for
+            # REQ-SEC-016 (PII) / -027 (credentials) / -043 (injection incl.
+            # tool_result) / -019 (URL-host) in a single walk. Runs even on a
+            # gateway retry: content is content regardless of prior admission.
+            #
+            # DEMO DEFAULT: deterministic detectors (reproducible, no extra AWS
+            # calls). The OPTIONAL probabilistic layer — Bedrock Guardrails
+            # ApplyGuardrail for the PII/prompt-attack categories — is the
+            # separately-configured _apply_guardrail_input path below; it is
+            # additive and defaults OFF so the demo works without a guardrail.
+            # The block reason names only the detector CLASS and never echoes
+            # the matched content (REQ-SEC-014).
+            #
+            # OUT OF SCOPE (deferred): response-path detectors REQ-SEC-026/-044
+            # (full-body response inspection / exfil), which require the Tier-2
+            # buffering interceptor and are load-bearing — see B7 design §2.3.
+            detection = _detectors.run_request_detectors(
+                parsed.body,
+                self.settings.url_host_allowlist
+                if self.settings.url_host_allowlist
+                else None,
+            )
+            if detection.blocked:
+                self._log(
+                    "content_blocked",
+                    request_id=request_id,
+                    user_id=user_id,
+                    action="content_blocked",
+                    original_model=model,
+                    # detector_class only — no matched content (REQ-SEC-014).
+                    reason=detection.detector_class,
+                )
+                raise GovernanceError(
+                    403, "content_blocked", detection.reason
                 )
             # Per-user rate limit (requests per minute). Runs before the budget
             # check so a burst is turned away for cents of DynamoDB, not tokens.
@@ -1325,10 +1923,17 @@ class GovernanceService:
                         original_model=model,
                         reason=reason,
                     )
+                    # Keep the machine code the UI classifies on
+                    # ('guardrail_intervened') but return a human-readable,
+                    # reason-specific sentence so a blocked user knows WHY and
+                    # can self-correct. The sentence never echoes the offending
+                    # content and is bounded + CR/LF-free (it may ride in a
+                    # header or JSON error). The specific reason category stays
+                    # in the CloudWatch audit record via the _log call above.
                     raise GovernanceError(
                         403,
                         "guardrail_intervened",
-                        "Request blocked by content safety policy",
+                        _human_guardrail_message(reason),
                     )
 
             existing = self.repository.get_request(request_id)
@@ -1369,6 +1974,34 @@ class GovernanceService:
                 bool(door_fallback) and model != door_fallback and over_threshold
             )
             effective_model = door_fallback if downgrade else model
+            # ── CP-3 Stage 8: Quota pre-flight USD estimate (B4, feature F3) ──
+            # After entitlement/allowed-set (stage 4) and downgrade resolution,
+            # price THIS request in USD and reject with 429 if consumed+reserved
+            # +estimate would exceed the user's USD budget (REQ-QUOTA-005/005A).
+            # Runs only when the policy carries a USD budget (budget_micro_usd
+            # > 0); otherwise the token-only path below is untouched (F2/sample
+            # behaviour preserved). This is the Lambda-side pre-read gate; the
+            # TOCTOU-safe enforcement extends admit()'s conditional write to the
+            # micro-USD ledger (reserved_micro_usd ADD, see admit()).
+            usd_reservation = self._usd_preflight(
+                policy, effective_model, parsed, usage_date, usage_pk, request_id, user_id
+            )
+            usd_reservation_micro_usd = (
+                usd_reservation[0] if usd_reservation is not None else None
+            )
+            usd_ceiling_micro_usd = (
+                usd_reservation[1] if usd_reservation is not None else None
+            )
+            # Worst-case token cost of this request, reserved against the
+            # budget for the duration so concurrent requests cannot all pass a
+            # check on the same stale settled figure. Same basis as the USD
+            # reservation above: the recorded input estimate plus the output
+            # ceiling min(requested_max_tokens, max_max_tokens). Settlement
+            # swaps it for the real figure, so over-reserving costs a caller
+            # nothing beyond a possible early 429 near the limit.
+            token_reservation = parsed.input_estimate_tokens + min(
+                parsed.requested_max_tokens, self.settings.max_max_tokens
+            )
             request_context = self._context(
                 request_id,
                 parsed,
@@ -1377,6 +2010,13 @@ class GovernanceService:
                 effective_model,
                 now,
                 interceptor_ms=int((time.monotonic() - handling_started) * 1000),
+                reserved_micro_usd=(usd_reservation_micro_usd or 0),
+                reserved_tokens=token_reservation,
+                rate=(
+                    _pricing.get_rate(effective_model, self.rate_sheet)
+                    if usd_reservation_micro_usd is not None
+                    else None
+                ),
             )
             # The threshold condition exists to catch the race where a
             # concurrent request pushes usage past the downgrade line between
@@ -1393,6 +2033,9 @@ class GovernanceService:
                     policy,
                     threshold_limit=threshold,
                     usage_expires_at=now + self.settings.usage_ttl_seconds,
+                    reservation_tokens=token_reservation,
+                    reservation_micro_usd=usd_reservation_micro_usd,
+                    usd_budget_ceiling_micro_usd=usd_ceiling_micro_usd,
                 )
             except ConditionalWriteFailed:
                 duplicate = self.repository.get_request(request_id)
@@ -1407,11 +2050,58 @@ class GovernanceService:
                 current_debit = self.repository.get_usage_debit(usage_pk)
                 if current_debit > policy.budget_tokens:
                     raise self._budget_error()
+                # The token condition now tests the reservation-inclusive
+                # accumulator, so a request can be refused while the SETTLED
+                # debit is still under budget -- concurrent reservations
+                # committed first. Checking only the settled figure here would
+                # misreport that as a conflict and fall through to the downgrade
+                # retry, which would re-admit and defeat the ceiling.
+                if token_reservation > 0:
+                    committed = self.repository.get_usage_committed(usage_pk)
+                    if committed + token_reservation > policy.budget_tokens:
+                        self._log(
+                            "token_budget_exceeded",
+                            request_id=request_id,
+                            user_id=user_id,
+                            action="budget_exceeded",
+                            status_code=429,
+                            effective_model=effective_model,
+                            reservation_tokens=token_reservation,
+                            committed_tokens=committed,
+                            settled_tokens=current_debit,
+                            budget_tokens=policy.budget_tokens,
+                        )
+                        raise self._budget_error()
+                # B4: the admit condition also asserts the USD ceiling, so a
+                # ConditionalWriteFailed can equally mean the USD budget was
+                # exceeded by a concurrent reservation committing first. Surface
+                # that as the USD budget error rather than misattributing it.
+                if usd_reservation_micro_usd is not None:
+                    consumed_usd, reserved_usd = self.repository.get_usd_ledger(usage_pk)
+                    if _usd_quota.would_exceed(
+                        consumed_usd,
+                        reserved_usd,
+                        # ceiling already includes headroom; compare at 0% more.
+                        usd_ceiling_micro_usd,
+                        usd_reservation_micro_usd,
+                        headroom_pct=0,
+                    ):
+                        raise self._usd_budget_error()
                 if (
                     door_fallback
                     and model != door_fallback
                     and current_debit > policy.downgrade_at_tokens
                 ):
+                    # B4: the retry routes to a DIFFERENT model (door_fallback),
+                    # so re-price the USD reservation for that model before
+                    # re-admitting. Re-runs the same Stage-8 pre-flight (may
+                    # itself 429 on the USD budget or 503 on a missing rate).
+                    retry_usd = self._usd_preflight(
+                        policy, door_fallback, parsed, usage_date, usage_pk,
+                        request_id, user_id,
+                    )
+                    retry_reservation = retry_usd[0] if retry_usd is not None else None
+                    retry_ceiling = retry_usd[1] if retry_usd is not None else None
                     request_context = self._context(
                         request_id,
                         parsed,
@@ -1419,16 +2109,30 @@ class GovernanceService:
                         usage_date,
                         door_fallback,
                         now,
+                        reserved_micro_usd=(retry_reservation or 0),
+                        reserved_tokens=token_reservation,
+                        rate=(
+                            _pricing.get_rate(door_fallback, self.rate_sheet)
+                            if retry_reservation is not None
+                            else None
+                        ),
                     )
                     try:
                         # threshold_limit=None relaxes only the model threshold.
                         # Repository.admit always retains the atomic budget
-                        # condition, so this fallback retry cannot overspend.
+                        # condition -- and now the reservation-inclusive token
+                        # ceiling as well -- so this fallback retry cannot
+                        # overspend. The reservation is re-asserted here rather
+                        # than inherited: the first attempt's transaction was
+                        # cancelled, so nothing was reserved by it.
                         self.repository.admit(
                             request_context,
                             policy,
                             threshold_limit=None,
                             usage_expires_at=now + self.settings.usage_ttl_seconds,
+                            reservation_tokens=token_reservation,
+                            reservation_micro_usd=retry_reservation,
+                            usd_budget_ceiling_micro_usd=retry_ceiling,
                         )
                     except ConditionalWriteFailed:
                         duplicate = self.repository.get_request(request_id)
@@ -1619,7 +2323,7 @@ class GovernanceService:
                 status_code=error.status_code,
                 model=model,
             )
-            return _error_output(error, request_id)
+            return _error_output(error, request_id, surface)
         except (TypeError, ValueError) as error:
             self._log(
                 "request_rejected",
@@ -1636,6 +2340,7 @@ class GovernanceService:
             return _error_output(
                 GovernanceError(503, "policy_invalid", "Governance policy is invalid"),
                 request_id,
+                surface,
             )
         except Exception as error:
             self._log(
@@ -1653,6 +2358,7 @@ class GovernanceService:
                     503, "governance_unavailable", "Governance service unavailable"
                 ),
                 request_id,
+                surface,
             )
 
     def _handle_response(
@@ -1694,6 +2400,31 @@ class GovernanceService:
                 reason = "usage_recorded" if usage is not None else "usage_unavailable"
             else:
                 reason = "upstream_error"
+            # A streamed response invokes this interceptor once PER EVENT, and
+            # the usage block only arrives on one of them (the final message for
+            # SSE, the metadata frame for EventStream). Finalizing on an earlier
+            # event would write the EVENT# row with nothing debited, and because
+            # that row is a conditional put the real usage arriving next would be
+            # rejected as already-settled -- the user's tokens would be silently
+            # dropped. So on a stream, wait for the event that carries usage.
+            #
+            # Only a genuinely non-streaming 2xx with no usage is released here,
+            # which is what frees the admission reservation when an upstream
+            # returns no counts at all. Errors still finalize immediately on
+            # either shape: there is no later event to wait for.
+            if (
+                usage is None
+                and 200 <= status_code < 300
+                and (_is_streaming_response(response) or request_context.streaming)
+            ):
+                self._log(
+                    "response_stream_pending",
+                    request_id=request_id,
+                    user_id=request_context.user_id,
+                    action="awaiting_usage_event",
+                    status_code=status_code,
+                )
+                return _passthrough_output()
             now = int(self.now())
             try:
                 self.repository.finalize(
@@ -1760,6 +2491,9 @@ class GovernanceService:
         effective_model: str,
         now: int,
         interceptor_ms: int = 0,
+        reserved_micro_usd: int = 0,
+        reserved_tokens: int = 0,
+        rate: "_pricing.Rate | None" = None,
     ) -> RequestContext:
         return RequestContext(
             request_id=request_id,
@@ -1780,6 +2514,16 @@ class GovernanceService:
             created_at=now,
             expires_at=now + self.settings.context_ttl_seconds,
             interceptor_ms=interceptor_ms,
+            reserved_micro_usd=reserved_micro_usd,
+            reserved_tokens=reserved_tokens,
+            rate_input_micro_usd_per_1k=(rate.input_micro_usd_per_1k if rate else 0),
+            rate_output_micro_usd_per_1k=(rate.output_micro_usd_per_1k if rate else 0),
+            rate_cache_read_micro_usd_per_1k=(
+                rate.cache_read_micro_usd_per_1k if rate else 0
+            ),
+            rate_cache_write_micro_usd_per_1k=(
+                rate.cache_write_micro_usd_per_1k if rate else 0
+            ),
         )
 
     def _request_retry_output(
@@ -1846,6 +2590,103 @@ class GovernanceService:
             f"Token budget for this {self.settings.budget_window} exceeded",
             retry_after=self.settings.retry_after_seconds,
         )
+
+    def _usd_budget_error(self) -> GovernanceError:
+        return GovernanceError(
+            429,
+            "budget_exceeded",
+            f"USD budget for this {self.settings.budget_window} exceeded",
+            retry_after=self.settings.retry_after_seconds,
+        )
+
+    def _usd_preflight(
+        self,
+        policy: Policy,
+        effective_model: str,
+        parsed: ParsedRequest,
+        usage_date: str,
+        usage_pk: str,
+        request_id: str | None,
+        user_id: str | None,
+    ) -> tuple[int, int] | None:
+        """CP-3 Stage 8 — pre-flight USD reservation (B4, REQ-QUOTA-005A).
+
+        Returns ``(reservation_micro_usd, usd_budget_ceiling_micro_usd)`` to
+        thread into ``admit()``'s conditional write, or ``None`` when USD quota
+        is not enabled for this user (``budget_micro_usd == 0``) so the
+        token-only path is untouched (F2/sample behaviour preserved).
+
+        Rejects (429 ``budget_exceeded``) here when the Lambda-side pre-read
+        already shows ``consumed + reserved + estimate`` over budget within the
+        ``budget_headroom_pct`` tolerance — a cheap early-out. The authoritative
+        TOCTOU-safe check is the returned ceiling/reservation asserted inside
+        ``admit()``'s transaction against the committed item (design §2.5 step
+        4); both evaluate the identical :func:`usd_quota.would_exceed`
+        arithmetic so they cannot disagree.
+
+        Fail-closed (spine §4 / REQ-SEC-010): a USD budget with an unpriced
+        model raises 503 rather than pricing at zero (design §2.11 step 3).
+
+        Reservation basis (design §2.5): input = recorded input estimate (F5:
+        estimate error is additive to the 1% headroom, documented); output =
+        the ``max_tokens`` ceiling ``min(requested_max_tokens, max_max_tokens)``
+        (F1: a streaming request with no max_tokens uses the ceiling — the
+        documented self-429 tradeoff; no overspend either way).
+        """
+        if policy.budget_micro_usd <= 0:
+            return None  # USD quota not enabled for this user → token path only.
+        rate = _pricing.get_rate(effective_model, self.rate_sheet)
+        if rate is None:
+            self._log(
+                "usd_preflight_no_rate",
+                request_id=request_id,
+                user_id=user_id,
+                action="pricing_unavailable",
+                status_code=503,
+                effective_model=effective_model,
+            )
+            raise GovernanceError(
+                503,
+                "pricing_unavailable",
+                "No USD rate available for the resolved model",
+            )
+        output_ceiling = min(parsed.requested_max_tokens, self.settings.max_max_tokens)
+        estimate = _usd_quota.estimate_reservation(
+            rate,
+            input_tokens_estimate=parsed.input_estimate_tokens,
+            max_tokens=output_ceiling,
+        )
+        effective_budget = _usd_quota.effective_budget_micro_usd(
+            policy.budget_micro_usd,
+            policy.temp_increase_micro_usd,
+            policy.temp_increase_period,
+            usage_date,
+        )
+        ceiling = _usd_quota.budget_ceiling(
+            effective_budget, self.settings.budget_headroom_pct
+        )
+        consumed, reserved = self.repository.get_usd_ledger(usage_pk)
+        if _usd_quota.would_exceed(
+            consumed,
+            reserved,
+            effective_budget,
+            estimate,
+            headroom_pct=self.settings.budget_headroom_pct,
+        ):
+            self._log(
+                "usd_budget_exceeded",
+                request_id=request_id,
+                user_id=user_id,
+                action="budget_exceeded",
+                status_code=429,
+                effective_model=effective_model,
+                estimate_micro_usd=estimate,
+                consumed_micro_usd=consumed,
+                reserved_micro_usd=reserved,
+                budget_micro_usd=effective_budget,
+            )
+            raise self._usd_budget_error()
+        return (estimate, ceiling)
 
     def _check_active_hours(self, now: int) -> None:
         """Refuse requests outside the deployment's active hours. Equal start
@@ -2107,13 +2948,29 @@ def _parse_request(event: Mapping[str, Any], settings: Settings) -> ParsedReques
 
 
 def _extract_prompt_text(messages: Any, system: Any, limit: int) -> str:
-    """Collect user-authored text from a request body for guardrail screening.
+    """Collect USER-authored text from a request body for guardrail screening.
 
-    Works across all three wire formats because each carries text in one of a
-    few shapes: a bare string (Anthropic content), a list of {"text": ...}
-    blocks (Converse content), or a system string or list of {"text": ...}.
-    Only text is screened; non-text blocks (images, tool results) are skipped.
-    The result is truncated to `limit` characters to bound the guardrail call.
+    Screens the message content only; the top-level ``system`` prompt is
+    DELIBERATELY EXEMPT. Rationale: on this gateway the ``system`` field is set
+    by trusted server-side callers (the AgentCore Runtime orchestrator and its
+    sub-agents, or an application's own backend), never by end users, so
+    screening it adds no protection while false-positive-blocking legitimate
+    orchestrator steering under PROMPT_ATTACK (a benign system prompt tripped the
+    filter). All genuinely untrusted content — the user's question, plus memory
+    and web-search results folded back in — arrives in ``messages`` and REMAINS
+    screened. The ``system`` parameter is retained (callers unchanged) but not
+    concatenated.
+
+    WARNING: this exemption is valid ONLY while every client sets ``system`` from
+    trusted code. If a client is ever added that lets user input reach the
+    ``system`` field (e.g. a user-editable persona), it must screen that content
+    itself or this exemption must be revisited (see Option B in the design notes).
+
+    Works across all three wire formats because message text is carried in one of
+    a few shapes: a bare string (Anthropic content), or a list of {"text": ...}
+    blocks (Converse/OpenAI content). Only text is screened; non-text blocks
+    (images, tool results) are skipped. The result is truncated to `limit`
+    characters to bound the guardrail call.
     """
     parts: list[str] = []
 
@@ -2121,12 +2978,9 @@ def _extract_prompt_text(messages: Any, system: Any, limit: int) -> str:
         if isinstance(value, str) and value:
             parts.append(value)
 
-    if isinstance(system, str):
-        _add(system)
-    elif isinstance(system, list):
-        for block in system:
-            if isinstance(block, Mapping):
-                _add(block.get("text"))
+    # NOTE: `system` is intentionally NOT screened — see the docstring. It is
+    # accepted only to keep the call site stable.
+    _ = system
 
     if isinstance(messages, list):
         for message in messages:
@@ -2392,6 +3246,19 @@ def _parse_sse_usage(text: str) -> Usage | None:
         message = payload.get("message")
         if isinstance(message, Mapping):
             candidates.append(message.get("usage"))
+        # OpenAI Responses API streams (Codex, and any Responses-API client)
+        # nest the counts one level deeper: the terminal `response.completed`
+        # event carries {"type": ..., "response": {..., "usage": {...}}}.
+        # Verified live against the mantle Responses door, whose final event
+        # held $.response.usage = {"input_tokens": 74, "output_tokens": 64,
+        # "total_tokens": 138, ...}. Without this candidate no event in the
+        # stream matches, _parse_response_usage returns None, and because the
+        # streaming guard then keeps deferring on every event the request is
+        # never settled at all -- the admission reservation dangles and the
+        # user is never debited for a streamed Responses turn.
+        nested = payload.get("response")
+        if isinstance(nested, Mapping):
+            candidates.append(nested.get("usage"))
         for candidate in candidates:
             usage = _usage_from_mapping(candidate)
             if usage is None:
@@ -2410,23 +3277,71 @@ _CONVERSE_FIELD_MAP: dict[str, str] = {
     "cache_creation_input_tokens": "cacheWriteInputTokenCount",
 }
 
+# The OpenAI-compatible doors (/inference/v1/chat/completions, and the Responses
+# API for the fields it shares) name the same counts differently again. Verified
+# live against the mantle chat door, which returned exactly
+# {"completion_tokens": 3, "prompt_tokens": 25, "total_tokens": 28}. Without
+# this map that usage block matches nothing, _usage_from_mapping returns None,
+# and the request is RELEASED instead of settled -- the user's own tokens never
+# reach their ledger. There is no OpenAI equivalent of the cache-write counter,
+# so only the three that exist are mapped; `total_tokens` is deliberately
+# ignored because the budget recomputes the weighted total itself.
+_OPENAI_FIELD_MAP: dict[str, str] = {
+    "input_tokens": "prompt_tokens",
+    "output_tokens": "completion_tokens",
+}
+
+
+def _openai_cached_tokens(value: Mapping[str, Any]) -> int | None:
+    """Cached prompt tokens from the OpenAI shape's nested details block.
+
+    The two OpenAI-compatible doors name this block differently: Chat
+    Completions reports `prompt_tokens_details.cached_tokens`, while the
+    Responses API reports `input_tokens_details.cached_tokens` (verified live
+    on the mantle Responses door). Both are checked so a cached prompt is
+    discounted on either surface. Returns None when absent or malformed, so
+    the caller treats it as zero rather than rejecting an otherwise good usage
+    block.
+    """
+    for key in ("prompt_tokens_details", "input_tokens_details"):
+        details = value.get(key)
+        if not isinstance(details, Mapping):
+            continue
+        cached = details.get("cached_tokens")
+        if isinstance(cached, bool) or not isinstance(cached, int) or cached < 0:
+            continue
+        return cached
+    return None
+
 
 def _usage_from_mapping(value: Any) -> Usage | None:
     if not isinstance(value, Mapping):
         return None
     found = False
     values: dict[str, int] = {}
+    openai_cached = _openai_cached_tokens(value)
     for field in USAGE_FIELDS:
-        # Try snake_case first (Anthropic), then camelCase (Converse)
+        # Anthropic snake_case, then Converse camelCase, then the
+        # OpenAI-compatible names.
         token_count = value.get(field)
+        alias_present = False
         if token_count is None:
-            token_count = value.get(_CONVERSE_FIELD_MAP.get(field, ""), 0)
+            converse_alias = _CONVERSE_FIELD_MAP.get(field, "")
+            token_count = value.get(converse_alias)
+            alias_present = converse_alias in value
+        if token_count is None:
+            openai_alias = _OPENAI_FIELD_MAP.get(field, "")
+            token_count = value.get(openai_alias)
+            alias_present = alias_present or openai_alias in value
+        if token_count is None and field == "cache_read_input_tokens" and openai_cached is not None:
+            token_count = openai_cached
+            alias_present = True
         if token_count is None:
             token_count = 0
         if isinstance(token_count, bool) or not isinstance(token_count, int) or token_count < 0:
             return None
         values[field] = token_count
-        found = found or (field in value or _CONVERSE_FIELD_MAP.get(field, "") in value)
+        found = found or field in value or alias_present
     return Usage(**values) if found else None
 
 
@@ -2496,21 +3411,25 @@ def _request_output(
     }
 
 
-def _error_output(error: GovernanceError, request_id: str | None) -> dict[str, Any]:
-    error_body: dict[str, Any] = {
-        "type": error.code,
-        "message": error.safe_message,
-        "request_id": request_id,
-    }
-    if error.retry_after is not None:
-        # The AgentCore Gateway strips custom response headers on a short-circuit,
-        # so the machine-readable retry hint is carried in the body as well as the
-        # (best-effort) Retry-After header below.
-        error_body["retry_after"] = error.retry_after
-    payload = {
-        "type": "error",
-        "error": error_body,
-    }
+def _error_output(
+    error: GovernanceError,
+    request_id: str | None,
+    surface: str | None = None,
+) -> dict[str, Any]:
+    # B6 / F5 (REQ-API-008): render the error in the shape of the API surface
+    # the client called. ``surface`` is derived from the request path by the
+    # caller (available even before the body parses) and defaults to the
+    # Anthropic shape — byte-for-byte the pre-F5 body — when it cannot be
+    # determined. The AgentCore Gateway strips custom response headers on a
+    # short-circuit, so ``retry_after`` is also carried in the body (below).
+    payload = _envelopes.render_error_body(
+        error.status_code,
+        error.code,
+        error.safe_message,
+        surface if surface is not None else _envelopes.DEFAULT_SURFACE,
+        request_id=request_id,
+        retry_after=error.retry_after,
+    )
     transformed: dict[str, Any] = {
         "statusCode": error.status_code,
         "contentType": "application/json",
@@ -2530,13 +3449,91 @@ def _passthrough_output() -> dict[str, Any]:
     return {"interceptorOutputVersion": OUTPUT_VERSION, "http": {}}
 
 
+def _is_model_listing_path(path: str) -> bool:
+    """True for a model-discovery route such as ``/inference/v1/models``.
+
+    The query string is stripped first: Claude Code asks for
+    ``/v1/models?limit=1000``. Both the Anthropic and the OpenAI families use
+    the same ``/v1/models`` path, so one matcher serves both surfaces.
+    """
+    return path.split("?", 1)[0].rstrip("/").endswith("/v1/models")
+
+
+def _model_listing_body(model_ids: list[str]) -> dict[str, Any]:
+    """A model list both the Anthropic and OpenAI SDK families can read.
+
+    The two families disagree on the envelope -- Anthropic returns
+    ``{"data": [...], "has_more": ...}`` with ``type``/``display_name`` per
+    entry, OpenAI returns ``{"object": "list", "data": [...]}`` with
+    ``object``/``owned_by`` -- and the shared ``/v1/models`` path gives no way
+    to tell which client is asking. Both read ``data[].id``, so this emits the
+    union of the two envelopes rather than guessing and breaking one of them.
+    """
+    entries = [
+        {
+            "id": model_id,
+            "type": "model",            # Anthropic
+            "display_name": model_id,   # Anthropic
+            "object": "model",          # OpenAI
+            "owned_by": model_id.split(".", 1)[0] if "." in model_id else "bedrock",
+            "created": 0,               # OpenAI clients that sort on it
+        }
+        for model_id in model_ids
+    ]
+    return {
+        "object": "list",               # OpenAI
+        "data": entries,
+        "has_more": False,              # Anthropic
+        "first_id": entries[0]["id"] if entries else None,
+        "last_id": entries[-1]["id"] if entries else None,
+    }
+
+
 def _interception_point(event: Mapping[str, Any]) -> str:
+    """Classify an interceptor invocation as the REQUEST or RESPONSE point.
+
+    The two target types on this gateway deliver DIFFERENT response shapes,
+    captured live in us-east-1:
+
+      inference connector (mantle door)
+        REQUEST : gatewayRequest set,  gatewayResponse None
+        RESPONSE: gatewayRequest None, gatewayResponse set
+      HTTP passthrough (bedrock-runtime door)
+        REQUEST : gatewayRequest set,  gatewayResponse None
+        RESPONSE: gatewayRequest set,  gatewayResponse set   <-- both present
+
+    Keying on "gatewayRequest is None" therefore recognised the response only
+    on the mantle door. On the passthrough door the response invocation fell
+    through to ``_handle_request``, which re-ran admission for a request_id it
+    had already admitted (visible as a second ``request_admitted`` with
+    action=idempotent and NO response-side log line) and then returned a
+    passthrough. Nothing settled in band there.
+
+    That is what left ``/bedrock-runtime/openai/v1/*`` completely unmetered:
+    the OpenAI-compatible Bedrock endpoints accept no request metadata at all
+    -- a body ``requestMetadata`` field is rejected with 400 validation_error,
+    and ``X-Amzn-Bedrock-Request-Metadata`` is accepted but dropped
+    (requestMetadata is null in the invocation log) -- so the asynchronous
+    invocation-log pipeline can never attribute them to a user. In-band
+    settlement is the only mechanism available on that path.
+
+    Presence of ``gatewayResponse`` is the reliable discriminator: it is set
+    on exactly the response invocations of both shapes. The older
+    ``gatewayRequest``-is-None test is kept as a fallback so any future shape
+    that omits the request but carries no response is still read as a
+    response.
+
+    Double settlement is not a risk. Runtime-door traffic can now be settled
+    both in band and by the invocation-log pipeline, but both commit through a
+    conditional put on ``EVENT#<request_id>``, so whichever arrives second is
+    a no-op.
+    """
     http = event.get("http")
-    if (
-        isinstance(http, Mapping)
-        and http.get("gatewayRequest") is None
-        and ("gatewayRequest" in http or "gatewayResponse" in http)
-    ):
+    if not isinstance(http, Mapping):
+        return "REQUEST"
+    if http.get("gatewayResponse") is not None:
+        return "RESPONSE"
+    if http.get("gatewayRequest") is None and "gatewayRequest" in http:
         return "RESPONSE"
     return "REQUEST"
 
@@ -2550,6 +3547,22 @@ def _gateway_response(event: Mapping[str, Any]) -> Mapping[str, Any]:
 def _response_status(response: Mapping[str, Any]) -> int:
     value = response.get("statusCode", 502)
     return value if isinstance(value, int) and not isinstance(value, bool) else 502
+
+
+def _is_streaming_response(response: Mapping[str, Any]) -> bool:
+    """Whether the gateway is delivering this response as a stream of events.
+
+    The gateway sets `isStreamingResponse` on each event of a streamed
+    response, and omits headers and statusCode on every event after the first.
+    Both are signals that more events are coming, so a missing usage block is
+    not yet final. Treated as a hint only: the admission row's own `streaming`
+    flag is checked alongside this, so a response that drops the field is still
+    handled correctly.
+    """
+    if response.get("isStreamingResponse") is True:
+        return True
+    # Follow-on events carry a body with neither headers nor a status code.
+    return "statusCode" not in response and "body" in response
 
 
 def _validate_model(model: Any) -> None:
@@ -2575,6 +3588,19 @@ def _request_item(context: RequestContext) -> dict[str, dict[str, Any]]:
         "created_at": _n(context.created_at),
         "expires_at": _n(context.expires_at),
         "interceptor_ms": _n(context.interceptor_ms),
+        # B4 USD Quota (F3): reservation + pinned pricing basis, so settlement
+        # releases exactly this reservation and debits the real cost on the
+        # same rate the estimate used (design §2.5 step 5 / §2.12 step 2).
+        "reserved_micro_usd": _n(context.reserved_micro_usd),
+        # The token reservation admission held, so settlement releases exactly
+        # this amount from the ceiling accumulator.
+        "reserved_tokens": _n(context.reserved_tokens),
+        "rate_input_micro_usd_per_1k": _n(context.rate_input_micro_usd_per_1k),
+        "rate_output_micro_usd_per_1k": _n(context.rate_output_micro_usd_per_1k),
+        "rate_cache_read_micro_usd_per_1k": _n(context.rate_cache_read_micro_usd_per_1k),
+        "rate_cache_write_micro_usd_per_1k": _n(
+            context.rate_cache_write_micro_usd_per_1k
+        ),
     }
 
 

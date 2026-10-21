@@ -34,6 +34,12 @@
       "Effect": "Allow",
       "Action": ["logs:CreateLogStream", "logs:PutLogEvents"],
       "Resource": "arn:aws:logs:REGION:ACCOUNT_ID:log-group:/aws/bedrock-agentcore/*:log-stream:*"
+    },
+    {
+      "Sid": "InvokeWebSearchGateway",
+      "Effect": "Allow",
+      "Action": "bedrock-agentcore:InvokeGateway",
+      "Resource": "arn:aws:bedrock-agentcore:REGION:ACCOUNT_ID:gateway/WEBSEARCH_GATEWAY_ID*"
     }
   ]
 }

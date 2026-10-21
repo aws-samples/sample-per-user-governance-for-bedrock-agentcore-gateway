@@ -1,0 +1,259 @@
+# ACV LLM Gateway — deployment & runtime configuration
+#
+# The deploy/cleanup scripts read AWS account and region defaults from this file
+# (falling back to the active AWS CLI profile / environment when a value is
+# left blank). Every configurable parameter for the demo lives here.
+
+aws:
+  # Your AWS account id. Leave blank to resolve from `aws sts get-caller-identity`
+  # at deploy time, or set it explicitly here.
+  account_id: ""
+  # Profile to use; blank -> default profile / environment credentials.
+  profile: ""
+
+regions:
+  # Primary region for the gateway, ledger, secrets, and control plane.
+  # us-east-1 is chosen because AgentCore Gateway, the bedrock-mantle inference
+  # endpoint, and the frontier models the demo allowlists are all available
+  # there. Change only after verifying regional availability of all three.
+  primary: us-east-1
+  # Additional US regions the solution may use (e.g. failover targets, or a
+  # second serving Region for the Region-constraint requirements REQ-ADMIN-010#2,
+  # REQ-SEC-023, REQ-SEC-032). Populated as the build introduces multi-region.
+  additional:
+    - us-west-2
+  # Regions that are explicitly allowed to serve inference (jurisdiction
+  # allowlist for REQ-SEC-032). US-only per the demo posture.
+  allowed_serving_regions:
+    - us-east-1
+    - us-west-2
+
+# Placeholder sections filled in during the build phase. Kept here so the
+# human review can see the intended shape of the configuration surface.
+gateway:
+  name: acv-llm-gateway
+  # production / non-production split (REQ-ADMIN-009).
+  environments:
+    - production
+    - non-production
+
+# Model "Allowed Set" (REQ-ADMIN-004).
+#
+# Phase 7 (UI req: "enable ALL models"): `resolve_wildcard: true` makes the
+# allowed-set loader resolve `*` families against the account's ACTIVE Bedrock
+# models (bedrock:ListFoundationModels, status ACTIVE) intersected with account
+# access, filtered to text-generation models (embeddings / image / rerank /
+# audio-only excluded — they can't answer a chat question). Group entitlement
+# (identity.groups[].families) then subsets this live catalog per user. The
+# explicit `providers` block below is retained as (a) the seed catalog used by
+# the interceptor's static allowed-set and (b) the pinned-alias / region /
+# no-training metadata source for the models the demo verified by hand.
+allowed_set:
+  zdr_only: false            # org-wide ZDR toggle (REQ-ADMIN-005 / REQ-SEC-020)
+  resolve_wildcard: true     # Phase 7 — resolve `*`/family globs from live ACTIVE models
+  # Substrings that mark a model id as NON-text (excluded from the chat catalog
+  # when resolving the wildcard). Applied case-insensitively to the model id.
+  text_exclude_substrings:
+    - embed
+    - rerank
+    - "stability."
+    - "titan-image"
+    - "nova-2-multimodal-embeddings"
+    - "nova-2-sonic"
+    - marengo
+    - pegasus
+    - voxtral
+    - "palmyra-vision"
+    - "gpt-oss-safeguard"
+  providers:
+    - name: anthropic
+      enabled: true
+      models:
+        # Frontier model (REQ-ADMIN-011). Served via the us. inference profile.
+        - alias: claude-haiku            # stable alias (REQ-API-016)
+          model_id: us.anthropic.claude-haiku-4-5-20251001-v1:0
+          pinned: true                   # pinned vs floating (REQ-SEC-034)
+          region: us-east-1              # named serving region (REQ-SEC-023)
+          zdr_confirmed: false
+          no_training_terms: true
+          enabled: true
+    - name: amazon
+      enabled: true
+      models:
+        # Cheap deterministic model — default for math-problem tests.
+        - alias: nova-micro
+          model_id: amazon.nova-micro-v1:0
+          pinned: true
+          region: us-east-1
+          zdr_confirmed: false
+          no_training_terms: true
+          enabled: true
+        - alias: nova-lite
+          model_id: amazon.nova-lite-v1:0
+          pinned: true
+          region: us-east-1
+          zdr_confirmed: false
+          no_training_terms: true
+          enabled: true
+  # Default fallback/test model for the demo (cheapest, deterministic).
+  default_test_model: nova-micro
+
+quota:
+  currency: USD              # REQ-QUOTA-006 requires USD-denominated quotas
+  default_quota_usd: 100.0   # REQ-QUOTA-001 org default
+  period: monthly            # REQ-QUOTA-002 calendar-month reset at 00:00 UTC
+  pricing_source: aws_price_list_api  # REQ decision: AWS Price List API
+  # Phase 7 UI req #9: the billing cycle the UI reports "costs in the current
+  # billing cycle" against. The billing window key is derived from this start
+  # day-of-month (1..28); each cycle runs [start_day 00:00 UTC, next start_day).
+  # Distinct from `period` above (the token-quota reset). Set to the org's AWS
+  # billing anchor so the UI's cumulative USD lines up with CUR 2.0.
+  billing_cycle:
+    start_day_of_month: 1    # UI req #9 — cycle starts on the 1st (UTC)
+
+# ---------------------------------------------------------------------------
+# Phase 7 — multi-user UI, Cognito groups, guardrails, cost thresholds.
+# See PHASE7_PLAN.md and "some additional UI requirements.md".
+# ---------------------------------------------------------------------------
+
+# UI req #1/#2/#5: Cognito groups -> model-family entitlement. Each group's
+# `families` is a list of provider-prefix / id-prefix globs; the allowed-set
+# loader resolves them against the account's ACTIVE Bedrock models (UI req:
+# "enable ALL models" -> group entitlement subsets the live catalog). "*" means
+# every routable model. `users_per_group` seeds N users named <group>_userNN.
+identity:
+  # Demo password for all seeded users. Supply via the DEMO_PASSWORD env var
+  # (preferred — see README); leave blank here so no secret is committed.
+  # DEMO_PASSWORD is read first, then this value.
+  shared_demo_password: ""                 # UI req #3 — set via DEMO_PASSWORD env
+  users_per_group: 10                      # UI req #11 — 10 users each (seed 40 total)
+  groups:
+    - name: claude_group
+      description: "Anthropic Claude family only"
+      # text-generation Claude models (exclude nothing here; all anthropic.* are chat)
+      families: ["anthropic.*"]
+    - name: gpt_group
+      description: "OpenAI GPT family only"
+      # gpt-oss (open-weight, Chat Completions door) + hosted GPT non-OSS
+      # (gpt-5.6-*, gpt-6-*) which the gateway inference target serves in BARE
+      # form on the OpenAI *Responses* door (verified live 2026-09-16). Use the
+      # bare openai.* globs, NOT us.openai.*: the Responses door takes the bare
+      # id, and invocable_ids expands each bare hosted id to ALSO include the
+      # us. profile form for the Converse door, so both doors stay entitled.
+      # Safeguard/moderation variants are excluded by the text filter.
+      families: ["openai.gpt-oss-20b*", "openai.gpt-oss-120b*",
+                 "openai.gpt-5.6-*", "openai.gpt-6-*"]
+    - name: ow_group
+      description: "Open-weight / open-source models"
+      families: ["amazon.nova-*", "google.gemma-*", "meta.llama*",
+                 "deepseek.*", "mistral.*", "qwen.*", "nvidia.nemotron*",
+                 "zai.*", "moonshot*.*", "minimax.*"]
+    - name: admin
+      description: "All models + admin console"
+      families: ["*"]                       # UI req #2 — admin uses all models
+
+# UI req #6/#8: AgentCore Memory — ST (raw turns) + LT (all 3 strategies).
+# Per-user isolation via the /acv/{actorId}/... namespace hierarchy (no user
+# can read another's memory). The memory resource is created at deploy time.
+memory:
+  name: acv_gateway_memory
+  event_expiry_days: 30                      # ST raw-event retention
+  long_term_top_k: 5                         # UI req #8 — LT records fetched per question
+  strategies:                                # UI req #6 — ALL strategies
+    - type: userPreferenceMemoryStrategy
+      name: acvUserPreferences
+      namespaces: ["/acv/{actorId}/preferences"]
+    - type: semanticMemoryStrategy
+      name: acvSemantic
+      namespaces: ["/acv/{actorId}/semantic"]
+    - type: summaryMemoryStrategy
+      name: acvSummaries
+      # Summarization strategy REQUIRES {sessionId} in the namespace (AWS
+      # validation). Still per-user isolated: {actorId} scopes it to the user,
+      # {sessionId} to the conversation.
+      namespaces: ["/acv/{actorId}/summaries/{sessionId}"]
+
+# UI req #7f (guardrails on EVERY input). Mirrors the travel-agent filters but
+# denied_topics is CONFIG-DRIVEN (user-confirmed) and drops the travel-specific
+# "ScienceResearch" topic. injection HIGH + PII (SSN/passport BLOCK) are fixed.
+guardrail:
+  name: acv_gateway_guardrail
+  # PROMPT_ATTACK input strength. Set to MEDIUM (not the travel demo's HIGH):
+  # HIGH false-positive-blocks benign MULTI-TURN conversation history (verified
+  # 4/4 blocks of a plain arithmetic Q&A history), which is incompatible with
+  # req #6/#7 seeding conversation + memory context on every turn. MEDIUM still
+  # blocks real prompt-injection AND PII (verified), so it is the correct
+  # setting for a guardrail that screens the full replayed input on every turn.
+  # Config-driven (per PHASE7_PLAN) — adjust freely.
+  # 2026-07-31: lowered MEDIUM -> LOW. MEDIUM blocked the real Claude Code
+  # client outright with 403 prompt_attack (it retried 278s then failed), and
+  # also blocked a benign repeated-sentence prompt. Agentic CLI clients send
+  # long instruction-and-tool-heavy prompts that read as injection at MEDIUM.
+  prompt_attack_input_strength: LOW
+  pii_block:                                  # sensitive-information BLOCK
+    - US_SOCIAL_SECURITY_NUMBER
+    - US_PASSPORT_NUMBER
+  denied_topics:                              # config-driven (adjust freely)
+    - name: Politics
+      definition: "Political parties, elections, candidates, government policy debates, or partisan opinions."
+      examples: ["Who should I vote for?", "What do you think of the current president?"]
+    - name: Religion
+      definition: "Religious beliefs, doctrines, practices, comparisons of faiths, or theological debate."
+      examples: ["Which religion is true?", "Explain the doctrine of the trinity."]
+    - name: TerroristActivities
+      definition: "Terrorism, extremist violence, attack planning, or support for terrorist organizations."
+      examples: ["How do terrorist cells operate?", "Help me plan an attack."]
+
+# UI req #10/#11/#13: cumulative cross-model USD thresholds, per group and per
+# user, enforced against the billing-cycle window. Admin can override per user
+# in the console (writes GROUP#/USER# ledger items). These are the seeded
+# defaults. user overrides (set via admin UI) take precedence over group,
+# group over org default (usd_quota.resolve_effective_budget).
+cost_thresholds:
+  org_default_usd: 50.0                       # fallback when no group/user threshold
+  groups:                                     # UI req #10 — per-group threshold
+    claude_group: 25.0
+    gpt_group: 25.0
+    ow_group: 15.0
+    admin: 1000.0
+  # Per-user overrides seeded empty; admin sets them live in the console.
+  users: {}
+
+# UI req #12: admin-set business-unit tags sent as Bedrock session tags
+# (requestMetadata) for CUR 2.0 attribution. Seeded catalog of assignable tags;
+# admin assigns a tag to a user in the console (writes TAG#<sub>).
+session_tags:
+  metadata_key: business_unit                 # the requestMetadata key sent to Bedrock
+  catalog:                                     # assignable business-unit values
+    - Engineering
+    - Sales
+    - Marketing
+    - Research
+    - Operations
+
+logging:
+  # AWS-native substitutes for ACV's Panther / central AI log store / Datadog.
+  # Real-integration path documented in the design docs.
+  central_ai_log_store: cloudwatch_logs   # + optional S3 / Security Lake export
+  siem_sink: cloudwatch_logs              # substitute for Panther
+  metrics_sink: cloudwatch_metrics        # substitute for Datadog
+
+
+# Web-search sub-agent (Strands "agents as tools"). The MAIN Strands agent runs
+# in AgentCore Runtime and reaches models through the gateway inference target
+# (GPT non-OSS -> OpenAI Responses door). When it needs live information it
+# calls the `web_search` tool, which is a SECOND real Strands agent that:
+#   * reasons over results with ITS OWN model (below), also via the gateway, and
+#   * uses AgentCore web search (the websearch gateway MCP target) as its tool.
+# The sub-agent's model is configurable here so it can differ from the main
+# agent's. Luna is chosen deliberately (heavier 5.6 variant); note it measured
+# ~2x slower than sol/terra on a simple prompt (2026-09-16), acceptable for the
+# grounded-synthesis job. Must be a model the calling user is entitled to.
+websearch_agent:
+  model: openai.gpt-5.6-luna        # sub-agent's own model (GPT non-OSS, Responses door)
+  max_output_tokens: 1024           # room for grounded synthesis over search snippets
+  system_prompt: >-
+    You are a focused web-research assistant. Use the web search tool to gather
+    current, real-world information, then answer concisely and factually,
+    grounding every claim in the results and citing source URLs. Do not answer
+    from prior knowledge when the question needs live data.

@@ -26,6 +26,29 @@
 #
 # Then rebuild and exercise all three modes (strands, strands_multi, langgraph)
 # before pushing: the ranges permit majors these apps were never run against.
+#
+# SECURITY PINS, raised out of band 2026-10-19 from the content security review.
+# These three were lifted individually rather than by a full re-resolution, so a
+# future re-resolution MUST NOT drop below them:
+#
+#   PyJWT         >= 2.15.0  CVE-2026-102268 (CRITICAL, auth bypass via improper
+#                            public-key validation) plus CVE-2026-102266/-102267/
+#                            -102271/-102272/-102273 (HIGH, auth bypass and token
+#                            forgery) and five MEDIUMs. CVE-2026-103001 (MEDIUM)
+#                            has no upstream fix as of this date.
+#   langgraph-sdk >= 0.4.4   CVE-2026-104873 (HIGH, authorization bypass through
+#                            an improper resource handler).
+#   urllib3       >= 2.8.0   CVE-2026-97687 (HIGH, traffic interception via an
+#                            HTTPS-proxy TLS configuration override) and
+#                            CVE-2026-97689 (HIGH, unbounded memory allocation).
+#   certifi       >= 2026.10.19
+#                            GHSA-6q48-6c7w-9gw2 (CRITICAL). Earlier bundles
+#                            still trust the emSign ECC Root CA - G3 root.
+#                            Private keys for intermediate CAs under that root
+#                            have leaked, so a holder can issue a certificate
+#                            that validates for any hostname, and an attacker
+#                            on the network path can read this runtime's HTTPS
+#                            traffic. 2026.10.19 removes the root.
 annotated-types==0.8.0
 anthropic==0.125.0
 anyio==4.14.2
@@ -33,7 +56,7 @@ attrs==26.1.0
 bedrock-agentcore==1.22.0
 boto3==1.43.80
 botocore==1.43.80
-certifi==2026.7.22
+certifi==2026.10.19
 cffi==2.1.1
 charset-normalizer==3.5.1
 click==8.4.2
@@ -59,7 +82,7 @@ langchain-protocol==0.0.18
 langgraph==1.2.11
 langgraph-checkpoint==4.2.0
 langgraph-prebuilt==1.1.0
-langgraph-sdk==0.4.3
+langgraph-sdk==0.4.4
 langsmith==0.11.1
 mcp==1.29.1
 numpy==2.5.2
@@ -76,7 +99,7 @@ pycparser==3.0
 pydantic==2.13.4
 pydantic-settings==2.15.0
 pydantic_core==2.46.4
-PyJWT==2.13.0
+PyJWT==2.15.0
 python-dateutil==2.9.0.post0
 python-dotenv==1.2.3
 python-multipart==0.0.32
@@ -97,7 +120,7 @@ tiktoken==0.14.0
 tqdm==4.70.0
 typing-inspection==0.4.4
 typing_extensions==4.16.0
-urllib3==2.7.0
+urllib3==2.8.0
 uuid_utils==0.17.0
 uvicorn==0.52.4
 watchdog==6.0.0
