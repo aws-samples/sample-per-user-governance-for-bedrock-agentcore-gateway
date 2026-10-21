@@ -39,6 +39,7 @@ RUN pip install --no-cache-dir -r /tmp/requirements.txt \
 RUN useradd --create-home --uid 1001 agent
 WORKDIR /app
 COPY app.py /app/app.py
+COPY websearch_client.py /app/websearch_client.py
 USER agent
 ENV HOME=/home/agent
 

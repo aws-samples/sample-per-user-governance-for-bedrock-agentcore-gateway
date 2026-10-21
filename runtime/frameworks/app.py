@@ -1,56 +1,46 @@
 # Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
 # SPDX-License-Identifier: MIT-0
 
-"""AgentCore Runtime entrypoint hosting agent-framework client patterns
-(Strands single-agent, Strands multi-agent, LangGraph) that call models THROUGH
-the AgentCore Gateway per-user governance stack over four wire "methods":
+"""AgentCore Runtime entrypoint: an ALWAYS multi-agent Strands supervisor
+(orchestrator + web-search sub-agent) that calls models THROUGH the AgentCore
+Gateway per-user governance stack.
 
-  * "messages"  Anthropic Messages API via the gateway's /inference door
-                (AnthropicModel / ChatAnthropic, Bearer auth).
-  * "converse"  Bedrock Converse via the native /bedrock-runtime door
-                (boto3 BedrockModel / ChatBedrockConverse, model id in the URL
-                path, Bearer-swap event hook after SigV4 signing).
-  * "invoke"    Bedrock InvokeModel via the native /bedrock-runtime door
-                (boto3 invoke_model, Anthropic body format, model id in the URL
-                path, same Bearer-swap event hook as converse).
-  * "openai"    OpenAI-compatible Chat Completions API via the gateway's
-                /inference door. The OpenAI SDK sends api_key as
-                "Authorization: Bearer <key>", so api_key=<user JWT> authenticates
-                against the gateway directly. base_url is <payload base_url>/v1
-                and the SDK appends /chat/completions.
+The runtime is unconditionally multi-agent with web search ALWAYS available.
+There is no single-agent path, no LangGraph, no streaming, and no caller-supplied
+mode/method. The caller supplies a MODEL id; the runtime DERIVES the gateway
+wire door from it (see _method_for_model — the sole home of model->API routing):
+
+  * "messages"  Anthropic Claude via the gateway /inference Messages door
+                (AnthropicModel, Bearer auth).
+  * "responses" OpenAI GPT non-OSS (gpt-5.6-*, gpt-6-*) via the /inference
+                OpenAI Responses door (OpenAIResponsesModel).
+  * "openai"    gpt-oss + open-weight via the /inference OpenAI Chat Completions
+                door (OpenAIModel).
+
+Each door runs a strands_multi orchestrator whose `web_search` tool is a SECOND
+real Strands agent (its own model, from config websearch_agent.model, e.g.
+Luna) that calls AgentCore web search and reasons over the results.
+
+Governance note: model ENTITLEMENT is NOT enforced here — it is enforced at the
+Gateway interceptor (per-user allowed_models), which every model call traverses
+carrying the user's JWT. So a caller that bypasses the UI and invokes this
+runtime directly is still governed: an unentitled model returns the Gateway's
+403 model_not_allowed. The runtime authorizer only checks the JWT is valid.
 
 Payload contract:
-    {"mode":   "strands" | "strands_multi" | "langgraph",
-     "method": "messages" | "converse" | "invoke" | "openai",  # optional, default messages
-     "prompt": str,          # the end user's prompt, executed as-is
-     "model":  str,          # optional; per-method default applies when absent
-     "base_url": str,        # messages/openai: <gateway_url>/inference
-                             #   (openai: the SDK appends /v1/chat/completions)
-                             # converse/invoke: <native_gateway_url>/bedrock-runtime
+    {"prompt": str,           # the end user's prompt, executed as-is
+     "model":  str,           # optional; defaults to DEFAULT_MODEL
+     "base_url": str,         # <gateway_url>/inference (all doors ride /inference)
+     "websearch_model": str,  # optional; the web-search sub-agent's model
+     "websearch_max_tokens": int (optional),
+     "websearch_system": str (optional),
      "max_tokens": int (optional),
-     "jwt": str (optional)}  # fallback only; see JWT sourcing note below
+     "jwt": str (optional)}   # fallback only; see JWT sourcing note below
 
-Supported (mode, method) combinations:
-    strands       x {messages, converse, invoke, openai}
-    strands_multi x {messages}
-    langgraph     x {messages, converse, openai}
-                    # converse requires langchain-aws in the image;
-                    # openai requires langchain-openai in the image.
-Unsupported combinations return
-    {"error_status": 400, "error_type": "unsupported_combo",
-     "error_message": "<mode> does not support <method>"}.
-
-Per-method model defaults (explicit payload "model" always wins):
-    messages          -> "anthropic.claude-haiku-4-5"
-    converse / invoke -> "us.anthropic.claude-haiku-4-5-20251001-v1:0"
-    openai            -> "gpt-oss-120b"
-
-Every response (success and error) carries a "timings" object of time.time()
-floats: received_at (top of handler), gateway_call_start (immediately before
-the model/agent call), first_token_at (first streamed chunk callback, or null
-when the path does not stream), done_at (after completion). Converse responses
-additionally carry model_latency_ms sourced from the Converse response
-metrics.latencyMs when present.
+Response: success {"method","model","text","timings"}; governance refusals and
+errors {"method","model","error_status","error_type","error_message",
+"retry_after","timings"}. The "timings" object carries time.time() floats:
+received_at, gateway_call_start, done_at.
 
 JWT sourcing (header-first, payload fallback)
 ---------------------------------------------
@@ -75,8 +65,6 @@ echoed back (see _redact).
 """
 from __future__ import annotations
 
-import importlib.util
-import json
 import os
 import re
 import time
@@ -95,19 +83,35 @@ DEFAULT_MAX_TOKENS = 4096
 MAX_TOKENS_CEILING = 8192
 CLIENT_TIMEOUT_S = 240.0  # heavy turns generate for minutes; do not give up at 60s
 
-DEFAULT_METHOD = "messages"
+# The runtime is UNCONDITIONALLY multi-agent (orchestrator + web-search
+# sub-agent) with web search ALWAYS available. There is no single-agent path and
+# no "method" in the payload: the runtime DERIVES the door/API from the model id
+# (see _method_for_model), which is the one place model->door routing lives.
+#
+# Per-family default model, applied when the caller omits "model":
+#   messages  (Anthropic Claude)        -> the /inference Anthropic Messages door
+#   responses (OpenAI GPT non-OSS)      -> the /inference OpenAI Responses door
+#   openai    (gpt-oss + open-weight)   -> the /inference OpenAI Chat Completions door
+DEFAULT_MODEL = "openai.gpt-5.6-sol"
 
-# Per-method model defaults. Messages rides the /inference door where the
-# gateway expects the Anthropic-prefixed alias; converse/invoke ride the native
-# /bedrock-runtime door where the model id is the inference-profile Bedrock id;
-# openai rides the /inference door's OpenAI-compatible Chat Completions surface
-# where the gateway expects an OpenAI-style model id.
-MODEL_DEFAULTS = {
-    "messages": "anthropic.claude-haiku-4-5",
-    "converse": "us.anthropic.claude-haiku-4-5-20251001-v1:0",
-    "invoke": "us.anthropic.claude-haiku-4-5-20251001-v1:0",
-    "openai": "gpt-oss-120b",
-}
+
+def _method_for_model(model_id: str) -> str:
+    """Derive the gateway wire door/method from the model id. This is the sole
+    home of model->API routing (agreed placement: in the runtime, next to where
+    the client is built, so every caller — UI, CLI, another agent — routes
+    identically and there is no second source of truth to drift).
+
+      * Anthropic Claude (anthropic.* / us.anthropic.*) -> "messages"
+      * OpenAI GPT non-OSS (openai.gpt-5.*, openai.gpt-6*, and us. profiles),
+        EXCLUDING gpt-oss                                -> "responses"
+      * everything else (gpt-oss, open-weight nova/gemma/llama/qwen/...) -> "openai"
+    """
+    mid = (model_id or "").lower()
+    if mid.startswith(("anthropic.", "us.anthropic.")):
+        return "messages"
+    if ("gpt-5" in mid or "gpt-6" in mid) and "oss" not in mid:
+        return "responses"
+    return "openai"
 
 # The AgentCore gateway hostname shape, which is the only host this runtime
 # needs to reach: <gateway-id>.gateway.bedrock-agentcore.<region>.amazonaws.com.
@@ -187,14 +191,6 @@ def _jwt_from_context(context: Any) -> str:
     return auth.strip()
 
 
-def _has_module(name: str) -> bool:
-    """True when an import spec exists for ``name`` (image capability probe)."""
-    try:
-        return importlib.util.find_spec(name) is not None
-    except (ImportError, ValueError):
-        return False
-
-
 def _error_details(error: BaseException) -> dict[str, Any]:
     """Walk the exception chain and surface gateway refusals as structured
     data: {error_status, error_type, error_message, retry_after}.
@@ -203,12 +199,30 @@ def _error_details(error: BaseException) -> dict[str, Any]:
     botocore ClientError path (converse/invoke methods). retry_after comes from
     the response body when the gateway includes it (e.g. budget_exceeded 429s),
     with the standard Retry-After response header as a fallback.
+
+    Defensive: each SDK is imported lazily and independently so a missing
+    package (e.g. anthropic absent when only the openai doors are packaged)
+    NEVER turns error formatting itself into a 500. The openai doors
+    (responses / chat) raise openai.APIStatusError, so that path is handled
+    explicitly — it is how the gateway's model_not_allowed / guardrail_intervened
+    403s surface for GPT and open-weight models.
     """
-    import anthropic as anthropic_sdk
+    # Lazy, independent SDK error classes — any missing package is simply skipped.
+    try:
+        import anthropic as _anthropic_sdk
+        _anthropic_err = _anthropic_sdk.APIStatusError
+    except Exception:
+        _anthropic_err = ()
+    try:
+        import openai as _openai_sdk
+        _openai_err = _openai_sdk.APIStatusError
+    except Exception:
+        _openai_err = ()
 
     cursor: BaseException | None = error
     while cursor is not None:
-        if isinstance(cursor, anthropic_sdk.APIStatusError):
+        # Anthropic Messages door (body is a dict with nested error).
+        if _anthropic_err and isinstance(cursor, _anthropic_err):
             body = getattr(cursor, "body", None)
             err = body.get("error", {}) if isinstance(body, dict) else {}
             retry_after = None
@@ -219,10 +233,25 @@ def _error_details(error: BaseException) -> dict[str, Any]:
                 header = getattr(response, "headers", {}) or {}
                 retry_after = header.get("retry-after")
             return {
-                "error_status": cursor.status_code,
-                "error_type": err.get("type"),
+                "error_status": getattr(cursor, "status_code", None),
+                "error_type": err.get("type") or err.get("code"),
                 "error_message": str(err.get("message"))[:300],
                 "retry_after": retry_after,
+            }
+        # OpenAI Responses / Chat Completions doors (gpt non-oss + gpt-oss +
+        # open-weight). The gateway's error envelope rides under .body.error or
+        # is reconstructable from the message; code carries model_not_allowed /
+        # guardrail_intervened / insufficient_quota.
+        if _openai_err and isinstance(cursor, _openai_err):
+            body = getattr(cursor, "body", None)
+            err = body.get("error", {}) if isinstance(body, dict) else {}
+            response = getattr(cursor, "response", None)
+            header = getattr(response, "headers", {}) or {}
+            return {
+                "error_status": getattr(cursor, "status_code", None),
+                "error_type": err.get("code") or err.get("type"),
+                "error_message": str(err.get("message") or cursor)[:300],
+                "retry_after": header.get("retry-after"),
             }
         botocore_details = _botocore_error_details(cursor)
         if botocore_details is not None:
@@ -337,279 +366,20 @@ def _call_agent(agent: Any, prompt: str, timings: dict[str, Any]) -> str:
         return _partial_from_agent(agent)
 
 
-def _run_strands_messages(jwt: str, base_url: str, model: str, prompt: str,
-                          max_tokens: int, timings: dict[str, Any]) -> str:
-    from strands import Agent
-
-    _cap_strands_retries()
-    agent = Agent(
-        model=_strands_model(jwt, base_url, model, max_tokens),
-        system_prompt="You are a concise, helpful assistant.",
-        callback_handler=None,
-    )
-    return _call_agent(agent, prompt, timings)
-
-
 def _run_strands_multi_messages(jwt: str, base_url: str, model: str, prompt: str,
                                 max_tokens: int, timings: dict[str, Any]) -> str:
-    from strands import Agent, tool
+    """Orchestrator (Anthropic Claude via the /inference Messages door) with the
+    web-search sub-agent wired as a tool. Web search is ALWAYS available."""
+    from strands import Agent
 
     _cap_strands_retries()
-
-    @tool
-    def researcher(question: str) -> str:
-        """Ask the researcher sub-agent a question and return its answer."""
-        sub_agent = Agent(
-            model=_strands_model(jwt, base_url, model, max_tokens),
-            system_prompt="You answer questions briefly and factually.",
-            callback_handler=None,
-        )
-        return str(sub_agent(question))
-
     orchestrator = Agent(
         model=_strands_model(jwt, base_url, model, max_tokens),
-        tools=[researcher],
-        system_prompt=(
-            "Call the researcher tool exactly once with the user's request, "
-            "then summarise its answer for the user."
-        ),
+        tools=[_make_websearch_tool(jwt, base_url, timings)],
+        system_prompt=_ORCHESTRATOR_SYSTEM,
         callback_handler=None,
     )
-    return _call_agent(orchestrator, prompt, timings)
-
-
-def _run_langgraph_messages(jwt: str, base_url: str, model: str, prompt: str,
-                            max_tokens: int, timings: dict[str, Any]) -> str:
-    from typing import TypedDict
-
-    import anthropic as anthropic_sdk
-    from langchain_anthropic import ChatAnthropic
-    from langgraph.graph import END, StateGraph
-
-    class GraphState(TypedDict):
-        question: str
-        draft: str
-        final: str
-
-    llm = ChatAnthropic(
-        model=model,
-        max_tokens=max_tokens,
-        # Auth requirement: ChatAnthropic requires an api_key value, but the
-        # gateway is Bearer-only. Give it a dummy key and inject Bearer-only
-        # clients below. max_retries=0 to surface refusals immediately.
-        api_key="unused-gateway-uses-bearer",
-        base_url=base_url,
-        max_retries=0,
-        timeout=CLIENT_TIMEOUT_S,
-    )
-    # Auth requirement: ChatAnthropic always forwards api_key and the SDK then
-    # sends x-api-key; the gateway rejects requests carrying both x-api-key
-    # and Authorization. _client/_async_client are cached properties, so
-    # inject Bearer-only anthropic clients directly into llm.__dict__.
-    llm.__dict__["_client"] = anthropic_sdk.Client(
-        auth_token=jwt, base_url=base_url, max_retries=0, timeout=CLIENT_TIMEOUT_S
-    )
-    llm.__dict__["_async_client"] = anthropic_sdk.AsyncClient(
-        auth_token=jwt, base_url=base_url, max_retries=0, timeout=CLIENT_TIMEOUT_S
-    )
-
-    def _text(reply: Any) -> str:
-        """Extract plain text from a LangChain AIMessage. Sonnet 5 returns a
-        list of content blocks (thinking, text, ...); keep only text blocks."""
-        content = reply.content
-        if isinstance(content, str):
-            return content
-        parts: list[str] = []
-        for block in content or []:
-            if isinstance(block, str):
-                parts.append(block)
-            elif isinstance(block, dict) and block.get("type") == "text":
-                parts.append(str(block.get("text", "")))
-        return "\n".join(p for p in parts if p).strip()
-
-    def drafter(state: GraphState) -> dict:
-        reply = llm.invoke("Draft a brief answer: " + state["question"])
-        return {"draft": _text(reply)}
-
-    def refiner(state: GraphState) -> dict:
-        reply = llm.invoke(
-            "Rewrite this draft as the final answer. If the draft already "
-            "satisfies the user's request exactly, return it unchanged. "
-            "Never add commentary.\nDraft:\n" + state["draft"]
-        )
-        return {"final": _text(reply)}
-
-    graph = StateGraph(GraphState)
-    graph.add_node("drafter", drafter)
-    graph.add_node("refiner", refiner)
-    graph.set_entry_point("drafter")
-    graph.add_edge("drafter", "refiner")
-    graph.add_edge("refiner", END)
-    timings["gateway_call_start"] = time.time()
-    output = graph.compile().invoke({"question": prompt})
-    return str(output.get("final", ""))
-
-
-# ---------------------------------------------------------------------------
-# converse method: Bedrock Converse via the native /bedrock-runtime door
-# ---------------------------------------------------------------------------
-def _bedrock_session(jwt: str, timings: dict[str, Any]):
-    """boto3 Session with the JWT Bearer-swap hook and a Converse latency
-    capture hook registered on its event system. Clients created from the
-    session inherit both hooks (same pattern as recipes/converse_sdk.py).
-
-    boto3 always SigV4-signs its requests; the gateway wants the user's JWT
-    instead, so request-created.bedrock-runtime rewrites Authorization after
-    signing. after-call.bedrock-runtime.Converse reads metrics.latencyMs from
-    the parsed Converse response into timings["model_latency_ms"].
-    """
-    import boto3
-
-    session = boto3.Session(region_name=os.environ.get("AWS_REGION", "us-east-1"))
-
-    def _swap_auth(request, **kwargs):
-        request.headers["Authorization"] = f"Bearer {jwt}"
-
-    def _capture_latency(parsed: Any = None, **kwargs):
-        if isinstance(parsed, dict):
-            metrics = parsed.get("metrics") or {}
-            latency = metrics.get("latencyMs")
-            if latency is not None:
-                timings["model_latency_ms"] = latency
-
-    session.events.register_last("request-created.bedrock-runtime", _swap_auth)
-    session.events.register("after-call.bedrock-runtime.Converse", _capture_latency)
-    return session
-
-
-def _run_strands_converse(jwt: str, base_url: str, model: str, prompt: str,
-                          max_tokens: int, timings: dict[str, Any]) -> str:
-    """Strands with BedrockModel: the NATIVE Converse wire format through the
-    passthrough gateway. The model id rides in the URL path, so this exercises
-    the gateway's second protocol door."""
-    from botocore.config import Config
-    from strands import Agent
-    from strands.models import BedrockModel
-
-    _cap_strands_retries()
-
-    # BedrockModel builds its own client from boto_session + endpoint_url
-    # (there is no client= parameter; an unknown kwarg is silently ignored,
-    # which would fall back to DIRECT Bedrock and bypass governance). Hooks
-    # registered on the session's event system propagate to clients created
-    # from it, so the JWT swap and latency capture attach at the session level.
-    session = _bedrock_session(jwt, timings)
-    agent = Agent(
-        model=BedrockModel(
-            boto_session=session,
-            endpoint_url=base_url,
-            boto_client_config=Config(
-                read_timeout=CLIENT_TIMEOUT_S, retries={"max_attempts": 0}
-            ),
-            model_id=model,
-            max_tokens=max_tokens,
-            streaming=False,
-        ),
-        system_prompt="You are a concise, helpful assistant.",
-        callback_handler=None,
-    )
-    return _call_agent(agent, prompt, timings)
-
-
-def _run_langgraph_converse(jwt: str, base_url: str, model: str, prompt: str,
-                            max_tokens: int, timings: dict[str, Any]) -> str:
-    """LangGraph over the native Converse door via langchain-aws
-    ChatBedrockConverse. Reachability of langchain-aws is checked before
-    dispatch (the combo is otherwise rejected as unsupported)."""
-    from typing import TypedDict
-
-    from botocore.config import Config
-    from langchain_aws import ChatBedrockConverse
-    from langgraph.graph import END, StateGraph
-
-    class GraphState(TypedDict):
-        question: str
-        draft: str
-        final: str
-
-    session = _bedrock_session(jwt, timings)
-    client = session.client(
-        "bedrock-runtime",
-        endpoint_url=base_url,
-        config=Config(read_timeout=CLIENT_TIMEOUT_S, retries={"max_attempts": 0}),
-    )
-    llm = ChatBedrockConverse(
-        client=client,
-        model=model,
-        max_tokens=max_tokens,
-    )
-
-    def _text(reply: Any) -> str:
-        content = reply.content
-        if isinstance(content, str):
-            return content
-        parts: list[str] = []
-        for block in content or []:
-            if isinstance(block, str):
-                parts.append(block)
-            elif isinstance(block, dict) and block.get("type") == "text":
-                parts.append(str(block.get("text", "")))
-        return "\n".join(p for p in parts if p).strip()
-
-    def drafter(state: GraphState) -> dict:
-        reply = llm.invoke("Draft a brief answer: " + state["question"])
-        return {"draft": _text(reply)}
-
-    def refiner(state: GraphState) -> dict:
-        reply = llm.invoke(
-            "Rewrite this draft as the final answer. If the draft already "
-            "satisfies the user's request exactly, return it unchanged. "
-            "Never add commentary.\nDraft:\n" + state["draft"]
-        )
-        return {"final": _text(reply)}
-
-    graph = StateGraph(GraphState)
-    graph.add_node("drafter", drafter)
-    graph.add_node("refiner", refiner)
-    graph.set_entry_point("drafter")
-    graph.add_edge("drafter", "refiner")
-    graph.add_edge("refiner", END)
-    timings["gateway_call_start"] = time.time()
-    output = graph.compile().invoke({"question": prompt})
-    return str(output.get("final", ""))
-
-
-# ---------------------------------------------------------------------------
-# invoke method: Bedrock InvokeModel via the native /bedrock-runtime door
-# ---------------------------------------------------------------------------
-def _run_strands_invoke(jwt: str, base_url: str, model: str, prompt: str,
-                        max_tokens: int, timings: dict[str, Any]) -> str:
-    """boto3 invoke_model with the Anthropic body format. The model id rides in
-    the URL path (modelId), and the same Bearer-swap event hook as converse
-    replaces the SigV4 Authorization header with the user's JWT."""
-    from botocore.config import Config
-
-    session = _bedrock_session(jwt, timings)
-    client = session.client(
-        "bedrock-runtime",
-        endpoint_url=base_url,
-        config=Config(read_timeout=CLIENT_TIMEOUT_S, retries={"max_attempts": 0}),
-    )
-    body = {
-        "anthropic_version": "bedrock-2023-05-31",
-        "max_tokens": max_tokens,
-        "system": "You are a concise, helpful assistant.",
-        "messages": [{"role": "user", "content": prompt}],
-    }
-    timings["gateway_call_start"] = time.time()
-    response = client.invoke_model(modelId=model, body=json.dumps(body))
-    payload = json.loads(response["body"].read())
-    parts: list[str] = []
-    for block in payload.get("content", []) or []:
-        if isinstance(block, dict) and block.get("type") == "text":
-            parts.append(str(block.get("text", "")))
-    return "\n".join(p for p in parts if p).strip()
-
+    return _call_agent(orchestrator, _seed_prompt(prompt), timings)
 
 # ---------------------------------------------------------------------------
 # openai method: OpenAI-compatible Chat Completions via the /inference door
@@ -621,244 +391,205 @@ def _openai_base_url(base_url: str) -> str:
     return trimmed if trimmed.endswith("/v1") else trimmed + "/v1"
 
 
-def _run_strands_openai(jwt: str, base_url: str, model: str, prompt: str,
-                        max_tokens: int, timings: dict[str, Any]) -> str:
-    """Strands with OpenAIModel: the OpenAI-compatible Chat Completions wire
-    format through the gateway's /inference door.
+def _openai_model(jwt: str, base_url: str, model: str,
+                  max_tokens: int = DEFAULT_MAX_TOKENS):
+    """Build a Strands OpenAIModel (Chat Completions) pointed at the gateway
+    /inference/v1 door. For gpt-oss + open-weight models.
 
-    Auth requirement: the OpenAI SDK sends api_key as
-    "Authorization: Bearer <key>", so passing the user's JWT as api_key
-    authenticates against the gateway's JWT authorizer directly (no auth_token
-    swap needed as with the Anthropic surface). client_args are forwarded
-    verbatim to openai.AsyncOpenAI; max_tokens rides in params, which merge
-    into the chat.completions request. max_retries=0 surfaces governance
-    refusals immediately instead of backing off."""
-    from strands import Agent
+    Auth: the OpenAI SDK sends api_key as "Authorization: Bearer <key>", so the
+    user's JWT as api_key authenticates against the gateway's JWT authorizer
+    directly. max_retries=0 surfaces governance refusals immediately."""
     from strands.models.openai import OpenAIModel
 
-    _cap_strands_retries()
-    agent = Agent(
-        model=OpenAIModel(
-            client_args={
-                "api_key": jwt,
-                "base_url": _openai_base_url(base_url),
-                "timeout": CLIENT_TIMEOUT_S,
-                "max_retries": 0,
-            },
-            model_id=model,
-            params={"max_tokens": max_tokens},
-        ),
-        system_prompt="You are a concise, helpful assistant.",
-        callback_handler=None,
-    )
-    return _call_agent(agent, prompt, timings)
-
-
-def _run_langgraph_openai(jwt: str, base_url: str, model: str, prompt: str,
-                          max_tokens: int, timings: dict[str, Any]) -> str:
-    """LangGraph over the OpenAI-compatible Chat Completions door via
-    langchain-openai ChatOpenAI. Reachability of langchain-openai is checked
-    before dispatch (the combo is otherwise rejected as unsupported).
-
-    Auth requirement: ChatOpenAI forwards api_key to the OpenAI SDK, which
-    sends "Authorization: Bearer <key>"; the user's JWT as api_key therefore
-    authenticates against the gateway directly. max_retries=0 surfaces
-    governance refusals immediately."""
-    from typing import TypedDict
-
-    from langchain_openai import ChatOpenAI
-    from langgraph.graph import END, StateGraph
-
-    class GraphState(TypedDict):
-        question: str
-        draft: str
-        final: str
-
-    # langchain-openai (>=1.x) remaps the constructor `max_tokens` to
-    # `max_completion_tokens` on the request body, but this gateway's Chat
-    # Completions surface requires the literal `max_tokens` integer. Passing
-    # it via extra_body lands it verbatim at the top level.
-    llm = ChatOpenAI(
-        model=model,
-        api_key=jwt,
-        base_url=_openai_base_url(base_url),
-        max_retries=0,
-        timeout=CLIENT_TIMEOUT_S,
-        extra_body={"max_tokens": max_tokens},
+    return OpenAIModel(
+        client_args={
+            "api_key": jwt,
+            "base_url": _openai_base_url(base_url),
+            "timeout": CLIENT_TIMEOUT_S,
+            "max_retries": 0,
+        },
+        model_id=model,
+        params={"max_tokens": max_tokens},
     )
 
-    def _text(reply: Any) -> str:
-        content = reply.content
-        if isinstance(content, str):
-            return content
-        parts: list[str] = []
-        for block in content or []:
-            if isinstance(block, str):
-                parts.append(block)
-            elif isinstance(block, dict) and block.get("type") == "text":
-                parts.append(str(block.get("text", "")))
-        return "\n".join(p for p in parts if p).strip()
 
-    def drafter(state: GraphState) -> dict:
-        reply = llm.invoke("Draft a brief answer: " + state["question"])
-        return {"draft": _text(reply)}
-
-    def refiner(state: GraphState) -> dict:
-        reply = llm.invoke(
-            "Rewrite this draft as the final answer. If the draft already "
-            "satisfies the user's request exactly, return it unchanged. "
-            "Never add commentary.\nDraft:\n" + state["draft"]
-        )
-        return {"final": _text(reply)}
-
-    graph = StateGraph(GraphState)
-    graph.add_node("drafter", drafter)
-    graph.add_node("refiner", refiner)
-    graph.set_entry_point("drafter")
-    graph.add_edge("drafter", "refiner")
-    graph.add_edge("refiner", END)
-    timings["gateway_call_start"] = time.time()
-    output = graph.compile().invoke({"question": prompt})
-    return str(output.get("final", ""))
-
-
-# (mode, method) -> runner. The keys are the full set of supported combos.
-RUNNERS = {
-    ("strands", "messages"): _run_strands_messages,
-    ("strands", "converse"): _run_strands_converse,
-    ("strands", "invoke"): _run_strands_invoke,
-    ("strands", "openai"): _run_strands_openai,
-    ("strands_multi", "messages"): _run_strands_multi_messages,
-    ("langgraph", "messages"): _run_langgraph_messages,
-    ("langgraph", "converse"): _run_langgraph_converse,
-    ("langgraph", "openai"): _run_langgraph_openai,
-}
-
-
-# ---------------------------------------------------------------------------
-# Streaming runners. Each is an async generator yielding text fragments as the
-# model produces them. The AgentCore Runtime SDK relays an async-generator
-# entrypoint as SSE automatically (one `data: {json}` event per yielded dict,
-# Content-Type text/event-stream); yield plain dicts only and never
-# self-serialize, or events get double-wrapped. This follows the SDK's
-# async-generator relay (bedrock_agentcore/runtime/app.py) and the response
-# streaming guide.
-# ---------------------------------------------------------------------------
-def _strands_stream_agent(mode: str, method: str, jwt: str, base_url: str,
-                          model: str, max_tokens: int):
-    """Build the same Agent the sync runner uses for this (mode, method)."""
+def _run_strands_multi_openai(jwt: str, base_url: str, model: str, prompt: str,
+                              max_tokens: int, timings: dict[str, Any]) -> str:
+    """Orchestrator (gpt-oss / open-weight via the /inference Chat Completions
+    door) with the web-search sub-agent wired as a tool. Web search is ALWAYS
+    available."""
     from strands import Agent
 
     _cap_strands_retries()
-    if method == "messages":
-        agent_model = _strands_model(jwt, base_url, model, max_tokens)
-    elif method == "openai":
-        from strands.models.openai import OpenAIModel
-        agent_model = OpenAIModel(
-            client_args={
-                "api_key": jwt,
-                "base_url": _openai_base_url(base_url),
-                "timeout": CLIENT_TIMEOUT_S,
-                "max_retries": 0,
-            },
-            model_id=model,
-            params={"max_tokens": max_tokens},
-        )
-    else:  # converse
-        from botocore.config import Config
-        from strands.models import BedrockModel
-        # Same session-level JWT swap as the sync converse runner; streaming
-        # on so ConverseStream serves the token deltas, which stream through
-        # the gateway.
-        agent_model = BedrockModel(
-            boto_session=_bedrock_session(jwt, {}),
-            endpoint_url=base_url,
-            boto_client_config=Config(
-                read_timeout=CLIENT_TIMEOUT_S, retries={"max_attempts": 0}
-            ),
-            model_id=model,
-            max_tokens=max_tokens,
-            streaming=True,
-        )
-    return Agent(
-        model=agent_model,
-        system_prompt="You are a concise, helpful assistant.",
+    orchestrator = Agent(
+        model=_openai_model(jwt, base_url, model, max_tokens),
+        tools=[_make_websearch_tool(jwt, base_url, timings)],
+        system_prompt=_ORCHESTRATOR_SYSTEM,
         callback_handler=None,
+    )
+    return _call_agent(orchestrator, _seed_prompt(prompt), timings)
+
+
+# ---------------------------------------------------------------------------
+# responses method: OpenAI Responses API via the /inference door (GPT non-OSS)
+# ---------------------------------------------------------------------------
+# Hosted GPT non-OSS models (openai.gpt-5.6-*, gpt-6-*) are served by the gateway
+# inference target on the OpenAI *Responses* door (/inference/v1/responses),
+# verified live 2026-09-16. The matching Strands provider is OpenAIResponsesModel
+# (NOT the Chat-Completions OpenAIModel). Same auth model as the openai method:
+# the OpenAI SDK sends api_key as "Authorization: Bearer", so the user's JWT as
+# api_key authenticates against the gateway directly.
+
+# Per-invocation web-search sub-agent config, resolved from config.yaml by the
+# CALLER (server) and passed in the payload. Held in a ContextVar so it reaches
+# the fixed-signature runner without threading a new positional through every
+# runner. Stateless: set at the top of invoke(), read inside the multi runner.
+import contextvars as _contextvars
+
+_WEBSEARCH_MODEL: _contextvars.ContextVar[str] = _contextvars.ContextVar(
+    "websearch_model", default=""
+)
+_WEBSEARCH_MAX_TOKENS: _contextvars.ContextVar[int] = _contextvars.ContextVar(
+    "websearch_max_tokens", default=1024
+)
+_WEBSEARCH_SYSTEM: _contextvars.ContextVar[str] = _contextvars.ContextVar(
+    "websearch_system",
+    default=(
+        "You are a focused web-research assistant. Use the web search tool to "
+        "gather current information, then answer concisely and factually, "
+        "grounding every claim in the results and citing source URLs."
+    ),
+)
+
+# Orchestrator steering, sent as the top-level system prompt. This is now safe:
+# the gateway's PROBABILISTIC guardrail (ApplyGuardrail) was scoped (2026-09-17,
+# Option A) to screen user/message content only and EXEMPT the trusted system
+# field, so legitimate steering no longer false-positive-trips PROMPT_ATTACK.
+# (User input, memory, and web-search results still ride in `messages` and are
+# still screened; the deterministic injection detector also still scans system
+# for literal jailbreak phrases, which this benign steering does not contain.)
+_ORCHESTRATOR_SYSTEM = (
+    "You are a helpful assistant. When the user's request needs current, "
+    "real-world, or post-training information, use the web_search tool with a "
+    "focused query and ground your answer on what it returns, citing sources. "
+    "For anything you already know, answer directly and concisely."
+)
+
+
+def _seed_prompt(prompt: str) -> str:
+    """Kept as a single seam for any future prompt shaping. Returns the user
+    prompt unchanged; orchestrator steering now rides the system field again."""
+    return prompt
+
+
+def _responses_model(jwt: str, base_url: str, model: str,
+                     max_tokens: int = DEFAULT_MAX_TOKENS):
+    """Build a Strands OpenAIResponsesModel pointed at the gateway /inference/v1
+    door. client_args go verbatim to openai.AsyncOpenAI; the JWT rides as
+    api_key (Bearer). max_output_tokens is the Responses-API output cap."""
+    from strands.models.openai_responses import OpenAIResponsesModel
+
+    return OpenAIResponsesModel(
+        client_args={
+            "api_key": jwt,
+            "base_url": _openai_base_url(base_url),
+            "timeout": CLIENT_TIMEOUT_S,
+            "max_retries": 0,
+        },
+        model_id=model,
+        params={"max_output_tokens": max_tokens},
     )
 
 
-async def _stream_strands(mode: str, method: str, jwt: str, base_url: str,
-                          model: str, prompt: str, max_tokens: int,
-                          timings: dict[str, Any]):
-    """Yield text fragments from a streaming strands run. Text deltas arrive
-    on stream_async events as the string under the "data" key; other event
-    kinds (tool use, lifecycle) are skipped. A max_tokens stop mid-stream
-    ends the generator cleanly with stopped_reason recorded; the fragments
-    already yielded ARE the partial reply, so nothing is lost."""
-    from strands.types.exceptions import MaxTokensReachedException
+def _make_websearch_tool(jwt: str, base_url: str, timings: dict[str, Any]):
+    """Return a Strands @tool that IS a second real Strands agent.
 
-    agent = _strands_stream_agent(mode, method, jwt, base_url, model, max_tokens)
-    timings["gateway_call_start"] = time.time()
-    try:
-        async for event in agent.stream_async(prompt):
-            data = event.get("data") if isinstance(event, dict) else None
-            if isinstance(data, str) and data:
-                if timings["first_token_at"] is None:
-                    timings["first_token_at"] = time.time()
-                yield data
-        timings["stopped_reason"] = "end_turn"
-    except MaxTokensReachedException:
-        timings["stopped_reason"] = "max_tokens"
+    The sub-agent:
+      * reasons with ITS OWN model (websearch_model from the payload/config,
+        default the main model) over the OpenAI Responses door, through the
+        SAME governance gateway (user JWT), and
+      * uses AgentCore web search (websearch_client, a SigV4 MCP call to the
+        websearch gateway) as its own tool.
+
+    This is the "agents as tools" pattern: the sub-agent is wrapped as a single
+    @tool the orchestrator can call. Its model is configurable so it can differ
+    from the orchestrator's (config websearch_agent.model, e.g. Luna)."""
+    from strands import Agent, tool
+
+    sub_model_id = _WEBSEARCH_MODEL.get() or ""
+    sub_max = _WEBSEARCH_MAX_TOKENS.get() or 1024
+
+    @tool
+    def agentcore_web_search(query: str) -> str:
+        """Search the live web via AgentCore web search and return grounded
+        result snippets with source URLs.
+
+        Args:
+            query: A focused search query (<= 200 chars).
+        """
+        try:
+            import websearch_client  # copied into the image alongside app.py
+        except Exception as e:  # pragma: no cover - image capability
+            return f"NO_RESULTS: web search unavailable ({type(e).__name__})"
+        out = websearch_client.search(query, max_results=6)
+        if not out.get("ok") or not out.get("results"):
+            return "NO_RESULTS: the web search returned nothing usable."
+        return websearch_client.results_as_context(out["results"])
+
+    @tool
+    def web_search(query: str) -> str:
+        """Research a question using live web search and return a grounded,
+        cited answer.
+
+        Use this for current, real-world, or post-training information (news,
+        prices, latest releases, "today", specifics you are unsure of). Not for
+        math or general knowledge you already have.
+
+        Args:
+            query: What to research (a question or focused query).
+        """
+        # The sub-agent reasons over search results with its own model, also
+        # through the governed gateway. Falls back to the orchestrator's model
+        # when no sub-agent model was supplied. No system_prompt (guardrail-safe,
+        # like the orchestrator); the agentcore_web_search tool description drives
+        # it. The query is seeded with a light research framing folded into the
+        # user turn.
+        model_id = sub_model_id or model
+        sub_agent = Agent(
+            model=_responses_model(jwt, base_url, model_id, sub_max),
+            tools=[agentcore_web_search],
+            callback_handler=None,
+        )
+        return str(sub_agent(query))
+
+    return web_search
 
 
-# Streaming-capable combos. invoke is request/response by API contract, and
-# strands_multi's orchestration and langgraph's two-node graph return whole
-# replies, so those run the sync runner and emit a final-only stream.
-STREAM_RUNNERS = {
-    ("strands", "messages"): _stream_strands,
-    ("strands", "openai"): _stream_strands,
-    ("strands", "converse"): _stream_strands,
+def _run_strands_multi_responses(jwt: str, base_url: str, model: str, prompt: str,
+                                 max_tokens: int, timings: dict[str, Any]) -> str:
+    """Orchestrator (main Strands agent, GPT non-OSS via the Responses door) with
+    the web-search sub-agent wired as a tool. Web search is ALWAYS available."""
+    from strands import Agent
+
+    _cap_strands_retries()
+    orchestrator = Agent(
+        model=_responses_model(jwt, base_url, model, max_tokens),
+        tools=[_make_websearch_tool(jwt, base_url, timings)],
+        system_prompt=_ORCHESTRATOR_SYSTEM,
+        callback_handler=None,
+    )
+    return _call_agent(orchestrator, _seed_prompt(prompt), timings)
+
+
+# Method -> multi-agent runner. The runtime is ALWAYS multi-agent (orchestrator
+# + web-search sub-agent); the method is DERIVED from the model id by
+# _method_for_model. There is deliberately no single-agent path, no langgraph,
+# no streaming, and no caller-supplied mode/method.
+MULTI_RUNNERS = {
+    "messages": _run_strands_multi_messages,    # Anthropic Claude
+    "responses": _run_strands_multi_responses,  # OpenAI GPT non-OSS
+    "openai": _run_strands_multi_openai,        # gpt-oss + open-weight
 }
-
-
-async def _streaming_invoke(mode: str, method: str, jwt: str, base_url: str,
-                            model: str, prompt: str, max_tokens: int,
-                            timings: dict[str, Any]):
-    """The async-generator entrypoint result for stream:true payloads.
-
-    Yields {"delta": fragment} per text fragment, then exactly one final
-    event {"mode", "method", "final": true, "text", "timings"}. When the
-    combo has no streaming runner, the sync runner produces the whole reply
-    and only the final event is emitted; the frontend handles both shapes.
-    A mid-stream failure is surfaced as a final-shaped error event so the
-    client always receives structured details.
-    """
-    parts: list[str] = []
-    try:
-        stream_runner = STREAM_RUNNERS.get((mode, method))
-        if stream_runner is not None:
-            async for fragment in stream_runner(
-                mode, method, jwt, base_url, model, prompt, max_tokens, timings
-            ):
-                parts.append(fragment)
-                yield {"delta": _redact(fragment, jwt)}
-            text = "".join(parts)
-        else:
-            text = RUNNERS[(mode, method)](
-                jwt, base_url, model, prompt, max_tokens, timings
-            )
-        timings["done_at"] = time.time()
-        yield {"mode": mode, "method": method, "final": True,
-               "text": _redact(text, jwt), "timings": timings}
-    except Exception as error:  # surface governance refusals (429/403) as data
-        details = _error_details(error)
-        details["mode"] = mode
-        details["method"] = method
-        details["final"] = True
-        details["error_message"] = _redact(str(details.get("error_message")), jwt)
-        timings["done_at"] = time.time()
-        details["timings"] = timings
-        yield details
 
 
 def _new_timings() -> dict[str, Any]:
@@ -877,13 +608,27 @@ def _new_timings() -> dict[str, Any]:
 def invoke(payload: dict[str, Any], context: Any = None) -> dict[str, Any]:
     # The second parameter MUST be named "context" for the SDK to pass the
     # RequestContext (see module docstring). Header-first, payload fallback.
+    #
+    # The runtime is UNCONDITIONALLY multi-agent with web search always on. The
+    # caller supplies a MODEL; the runtime DERIVES the door/method from it
+    # (_method_for_model) and dispatches the matching orchestrator+sub-agent
+    # runner. There is no mode/method/stream in the contract anymore.
     timings = _new_timings()
-    mode = str(payload.get("mode", ""))
-    method = str(payload.get("method", "") or DEFAULT_METHOD)
     prompt = str(payload.get("prompt", ""))
     base_url = str(payload.get("base_url", ""))
-    # Explicit payload model wins; otherwise fall back to the per-method default.
-    model = str(payload.get("model", "") or MODEL_DEFAULTS.get(method, ""))
+    model = str(payload.get("model", "") or DEFAULT_MODEL)
+    # Web-search sub-agent config. The CALLER (server) resolves these from
+    # config.yaml websearch_agent.* and passes them in the payload; the container
+    # consumes them as read-only per-invocation input (stateless — no config file
+    # baked in, no self-mutation). Empty model => sub-agent reuses the default.
+    _WEBSEARCH_MODEL.set(str(payload.get("websearch_model", "") or ""))
+    try:
+        _WEBSEARCH_MAX_TOKENS.set(int(payload.get("websearch_max_tokens", 1024)))
+    except (TypeError, ValueError):
+        _WEBSEARCH_MAX_TOKENS.set(1024)
+    _ws_sys = str(payload.get("websearch_system", "") or "")
+    if _ws_sys:
+        _WEBSEARCH_SYSTEM.set(_ws_sys)
     raw_max = payload.get("max_tokens", DEFAULT_MAX_TOKENS)
     try:
         max_tokens = max(1, min(int(raw_max), MAX_TOKENS_CEILING))
@@ -891,33 +636,21 @@ def invoke(payload: dict[str, Any], context: Any = None) -> dict[str, Any]:
         max_tokens = DEFAULT_MAX_TOKENS
     jwt = _jwt_from_context(context) or str(payload.get("jwt", ""))
 
+    method = _method_for_model(model)
+
     if not prompt or not jwt or not base_url or not model:
         timings["done_at"] = time.time()
-        return {"mode": mode, "method": method, "error_status": None,
+        return {"method": method, "error_status": None,
                 "error_type": "bad_request",
-                "error_message": ("payload requires mode/method/prompt/base_url "
-                                  "and a JWT (Authorization header or payload)"),
+                "error_message": ("payload requires prompt/base_url/model and a "
+                                  "JWT (Authorization header or payload)"),
                 "retry_after": None, "timings": timings}
 
-    runner = RUNNERS.get((mode, method))
-    if runner is None or (
-        mode == "langgraph" and method == "converse" and not _has_module("langchain_aws")
-    ) or (
-        mode == "langgraph" and method == "openai" and not _has_module("langchain_openai")
-    ):
-        timings["done_at"] = time.time()
-        return {"mode": mode, "method": method, "error_status": 400,
-                "error_type": "unsupported_combo",
-                "error_message": f"{mode} does not support {method}",
-                "retry_after": None, "timings": timings}
-
-    # Everything below this point treats prompt, model and base_url as trusted:
-    # base_url becomes the endpoint each client sends the JWT to, and on
-    # converse/invoke the model id becomes a segment of the request path.
-    # Validate them here, once, so no runner has to.
+    # prompt/model/base_url are trusted below (base_url is where the JWT is sent).
+    # Validate once here.
     def _bad_request(message: str) -> dict[str, Any]:
         timings["done_at"] = time.time()
-        return {"mode": mode, "method": method, "error_status": 400,
+        return {"method": method, "error_status": 400,
                 "error_type": "bad_request", "error_message": message,
                 "retry_after": None, "timings": timings}
 
@@ -931,24 +664,16 @@ def invoke(payload: dict[str, Any], context: Any = None) -> dict[str, Any]:
     except ValueError as rejected:
         return _bad_request(str(rejected))
 
-    # stream:true returns an async generator; the SDK relays each yielded
-    # dict as one SSE data event. A plain return NEVER streams (the SDK does
-    # not inspect accept headers), so the generator path is the only way to
-    # stream and the sync path below is the only way not to.
-    if bool(payload.get("stream")):
-        return _streaming_invoke(
-            mode, method, jwt, base_url, model, prompt, max_tokens, timings
-        )
-
+    runner = MULTI_RUNNERS[method]  # method is always one of the three keys
     try:
         text = runner(jwt, base_url, model, prompt, max_tokens, timings)
         timings["done_at"] = time.time()
-        return {"mode": mode, "method": method, "text": _redact(text, jwt),
-                "timings": timings}
+        return {"method": method, "model": model,
+                "text": _redact(text, jwt), "timings": timings}
     except Exception as error:  # surface governance refusals (429/403) as data
         details = _error_details(error)
-        details["mode"] = mode
         details["method"] = method
+        details["model"] = model
         details["error_message"] = _redact(str(details.get("error_message")), jwt)
         timings["done_at"] = time.time()
         details["timings"] = timings

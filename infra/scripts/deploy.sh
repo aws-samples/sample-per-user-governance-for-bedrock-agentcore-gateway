@@ -89,6 +89,9 @@ REGION="${AWS_REGION:-}"
 FORCE_LOGGING=0
 REUSE_LOGGING=0
 NAME_SUFFIX=""
+GUARDRAIL_ID=""
+GUARDRAIL_VERSION=""
+EXTRA_CDK_CONTEXT=()
 while [ "$#" -gt 0 ]; do
   case "$1" in
     --region) REGION="$2"; shift 2 ;;
@@ -99,6 +102,14 @@ while [ "$#" -gt 0 ]; do
     --demo-username=*) DEMO_USERNAME="${1#*=}"; shift ;;
     --suffix) NAME_SUFFIX="$2"; shift 2 ;;
     --suffix=*) NAME_SUFFIX="${1#*=}"; shift ;;
+    --guardrail-id) GUARDRAIL_ID="$2"; shift 2 ;;
+    --guardrail-id=*) GUARDRAIL_ID="${1#*=}"; shift ;;
+    --guardrail-version) GUARDRAIL_VERSION="$2"; shift 2 ;;
+    --guardrail-version=*) GUARDRAIL_VERSION="${1#*=}"; shift ;;
+    # Pass an arbitrary CDK context entry straight through to `cdk deploy`,
+    # e.g. --cdk-context observabilityTraces=false
+    -c|--cdk-context) EXTRA_CDK_CONTEXT+=(--context "$2"); shift 2 ;;
+    --cdk-context=*) EXTRA_CDK_CONTEXT+=(--context "${1#*=}"); shift ;;
     -h|--help)
       grep '^#' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
       exit 0 ;;
@@ -109,6 +120,14 @@ REGION="${REGION:-us-east-1}"
 export AWS_REGION="$REGION"
 export AWS_DEFAULT_REGION="$REGION"
 export CDK_DEFAULT_REGION="$REGION"
+
+# Guardrail must be passed as a pair (both or neither), mirroring the CDK
+# validation in governance-stack.ts. Passing only one is a configuration error.
+if { [ -n "$GUARDRAIL_ID" ] && [ -z "$GUARDRAIL_VERSION" ]; } || \
+   { [ -z "$GUARDRAIL_ID" ] && [ -n "$GUARDRAIL_VERSION" ]; }; then
+  echo "ERROR: --guardrail-id and --guardrail-version must be set together" >&2
+  exit 2
+fi
 
 if [ -n "$NAME_SUFFIX" ]; then
   # Mirrors the validation in bin/app.ts; failing here is friendlier than a
@@ -324,6 +343,13 @@ CDK_CTX=()
 if [ -n "$NAME_SUFFIX" ]; then
   CDK_CTX+=(--context "nameSuffix=$NAME_SUFFIX")
 fi
+if [ -n "$GUARDRAIL_ID" ] && [ -n "$GUARDRAIL_VERSION" ]; then
+  # Wires GUARDRAIL_ID/GUARDRAIL_VERSION env vars onto the interceptor Lambda
+  # AND grants it bedrock:ApplyGuardrail (governance-stack.ts). Without this the
+  # interceptor's guardrail screening is silently disabled.
+  CDK_CTX+=(--context "guardrailId=$GUARDRAIL_ID" --context "guardrailVersion=$GUARDRAIL_VERSION")
+  echo "  guardrail: $GUARDRAIL_ID v$GUARDRAIL_VERSION (input screening enabled)"
+fi
 if [ -n "$REUSE_LOG_GROUP" ]; then
   CDK_CTX+=(--context "existingInvocationLogGroupName=$REUSE_LOG_GROUP")
   if [ "$ADOPT_STACK_LOGGING" -eq 1 ]; then
@@ -340,6 +366,7 @@ echo "[2/8] Deploying stack '$STACK_NAME' (this can take several minutes)..."
 npx cdk deploy "$STACK_NAME" \
   --require-approval never \
   ${CDK_CTX[@]+"${CDK_CTX[@]}"} \
+  ${EXTRA_CDK_CONTEXT[@]+"${EXTRA_CDK_CONTEXT[@]}"} \
   --outputs-file "$OUTPUTS_FILE"
 echo "  deploy complete."
 echo ""

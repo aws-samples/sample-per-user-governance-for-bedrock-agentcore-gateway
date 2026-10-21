@@ -46,7 +46,7 @@ export const DEFAULT_FALLBACK_MODEL = 'us.anthropic.claude-haiku-4-5-20251001-v1
  * The handler code is standard library plus the runtime's bundled boto3, with
  * no dependency pinned to a particular Python, so the runtime is swappable.
  */
-const LAMBDA_RUNTIME = lambda.Runtime.PYTHON_3_14;
+export const LAMBDA_RUNTIME = lambda.Runtime.PYTHON_3_14;
 
 /** Bring-your-own identity provider. Any OIDC issuer the gateway can validate. */
 export interface OidcConfig {
@@ -155,12 +155,37 @@ export interface GovernanceGatewayProps {
   readonly cacheTokenWeights?: { readonly readPct: number; readonly writePct: number };
 
   /**
+   * Ceiling on a request's `max_tokens` / `maxTokens` / `max_output_tokens`.
+   * The Anthropic Messages and OpenAI Chat Completions doors REJECT a request
+   * above this with 400 `invalid_max_tokens`; only the Responses door clamps.
+   *
+   * The default is deliberately higher than the interceptor's own 16384
+   * fallback because agentic CLI clients ask for far more than a chat client
+   * does: Claude Code against the mantle door was rejected outright at 16384
+   * with `400 max_tokens must be between 1 and 16384` and retried for 278s
+   * before failing. Lower it only if every client is known to ask for less.
+   * @default 64000
+   */
+  readonly maxMaxTokens?: number;
+
+  /**
    * Bedrock guardrail applied to request text at admission (input screening
    * via ApplyGuardrail). Blocked content is refused with the guardrail's
    * message before any model call. Both fields must be set together.
    * @default undefined (no guardrail screening)
    */
   readonly guardrail?: { readonly id: string; readonly version: string };
+
+  /**
+   * Phase 7: value for the interceptor's PRICING_DEFAULT_ESTIMATE env var.
+   * "1" (or an "in/out/cread/cwrite" micro-USD-per-1k tuple) makes USD quota
+   * price models absent from the seed rate sheet at a conservative ESTIMATED
+   * rate instead of failing closed with 503 pricing_unavailable — required so
+   * per-user USD thresholds enforce across the full "enable ALL models"
+   * catalog. Empty (default) preserves the original F3 fail-closed behavior.
+   * @default '' (fail closed on unknown models)
+   */
+  readonly pricingDefaultEstimate?: string;
 
   /**
    * Per-user requests-per-minute cap applied to users without an explicit
@@ -224,13 +249,29 @@ export interface GovernanceGatewayProps {
 /**
  * Per-user governance for an Amazon Bedrock AgentCore Gateway.
  *
- * Creates the engine: a REQUEST-only Lambda interceptor
+ * Creates the engine: a REQUEST + RESPONSE Lambda interceptor
  * keyed on the validated JWT subject, a DynamoDB ledger, and (by default) a
  * CUSTOM_JWT gateway fronting Amazon Bedrock through the `bedrock-mantle`
  * inference connector, with a Cognito user pool as the identity provider.
- * There is no RESPONSE interceptor: responses stream directly to the client,
- * and actual token usage is debited asynchronously by an attribution Lambda
- * fed from Bedrock model invocation logs via a subscription filter.
+ *
+ * Usage is debited on two paths. The RESPONSE interceptor settles the mantle
+ * (`/inference`) door in band, which is the only way to meter it per user.
+ * The `bedrock-runtime` door is debited asynchronously by an attribution
+ * Lambda fed from Bedrock model invocation logs via a subscription filter.
+ * Both commit through a conditional put on `EVENT#<request_id>`, so whichever
+ * arrives second is a no-op.
+ *
+ * STREAMING TRADEOFF (measured, us-east-1): registering a RESPONSE
+ * interceptor makes the gateway buffer the whole upstream response before
+ * relaying it. With REQUEST+RESPONSE, time-to-first-byte equals
+ * time-to-last-byte on both doors; with REQUEST only, bytes arrive
+ * progressively and match a direct bedrock-runtime call. Responses are still
+ * correct and still carry event-stream framing, but they are not delivered
+ * incrementally. That matters for interactive CLI clients: Claude Code's
+ * gateway protocol requires incremental relay and aborts a turn after five
+ * minutes with no bytes, so a single generation long enough to exceed that
+ * window will fail. At ~112 output tokens/sec (haiku-4-5, measured) five
+ * minutes is roughly 34k output tokens.
  *
  * Enforcement behavior: 403 for blocked users, 429 with
  * `retry_after` in the JSON body when the daily budget is exceeded, model
@@ -269,6 +310,13 @@ export class GovernanceGateway extends Construct {
   public bedrockLoggingRoleArn?: string;
   /** '-<nameSuffix>' or '', appended to the account-scoped names we choose. */
   private readonly suffix: string;
+  /**
+   * Name of the vended-logs CloudWatch group the gateway delivers its
+   * APPLICATION_LOGS to (CP-16). Absent when observability is disabled or an
+   * existing gateway is adopted (this stack does not own that gateway's
+   * delivery wiring). Exported by the stack as a CfnOutput.
+   */
+  public vendedLogGroupName?: string;
 
   constructor(scope: Construct, id: string, props: GovernanceGatewayProps = {}) {
     super(scope, id);
@@ -408,10 +456,19 @@ export class GovernanceGateway extends Construct {
         BUDGET_WINDOW: budgetWindow,
         CACHE_READ_WEIGHT_PCT: String(props.cacheTokenWeights?.readPct ?? 10),
         CACHE_WRITE_WEIGHT_PCT: String(props.cacheTokenWeights?.writePct ?? 125),
+        // Must exceed what agentic clients request or they are refused at
+        // admission; see the maxMaxTokens prop for the measured Claude Code
+        // failure at the interceptor's 16384 default.
+        MAX_MAX_TOKENS: String(props.maxMaxTokens ?? 64_000),
         ACTIVE_HOURS: activeHours,
         ACTIVE_HOURS_TZ: activeHoursTz,
         GUARDRAIL_ID: props.guardrail?.id ?? '',
         GUARDRAIL_VERSION: props.guardrail?.version ?? '',
+        // Phase 7: price unknown models at a conservative ESTIMATED rate so
+        // per-user USD thresholds enforce across the whole "enable ALL models"
+        // catalog (costs labelled estimated). Empty string preserves the
+        // original F3 fail-closed (503 pricing_unavailable) behavior.
+        PRICING_DEFAULT_ESTIMATE: props.pricingDefaultEstimate ?? '',
       },
     });
     if (props.guardrail) {
@@ -490,6 +547,23 @@ export class GovernanceGateway extends Construct {
       });
       discoveryUrl = `https://cognito-idp.${Aws.REGION}.amazonaws.com/${this.userPool.userPoolId}/.well-known/openid-configuration`;
       clientId = this.userPoolClient.userPoolClientId;
+
+      // Phase 7 (UI req #1/#2): Cognito groups that determine model-family
+      // entitlement. Membership is the only thing that varies per user; the
+      // group -> allowed_models mapping is resolved from the live ACTIVE model
+      // catalog at deploy time (see lambda/model_catalog.py)
+      // and written onto each member's POLICY# item. The group names here MUST
+      // match config.yaml identity.groups[].name and the interceptor never
+      // reads cognito:groups directly (entitlement is the seeded per-user
+      // allowed_models set), so these groups are for identity/admin grouping
+      // and are the source of truth the seeder maps from.
+      for (const groupName of ['claude_group', 'gpt_group', 'ow_group', 'admin']) {
+        new cognito.CfnUserPoolGroup(this, `Group-${groupName}`, {
+          userPoolId: this.userPool.userPoolId,
+          groupName,
+          description: `Phase 7 entitlement group: ${groupName}`,
+        });
+      }
     }
 
     // The gateway execution role. The L2 Gateway construct would create this
@@ -531,6 +605,15 @@ export class GovernanceGateway extends Construct {
           // inference profiles; without this ARN the passthrough target gets
           // AccessDenied on InvokeModelWithResponseStream.
           `arn:${Aws.PARTITION}:bedrock:*:${Aws.ACCOUNT_ID}:inference-profile/global.anthropic.claude-*`,
+          // Phase 7/8: hosted OpenAI GPT (gpt-5.6-*, gpt-6-*) have NO on-demand
+          // throughput and are NOT served by the mantle /inference OpenAI door;
+          // they are only invocable via their `us.openai.*` cross-region
+          // inference profile through the /bedrock-runtime Converse passthrough
+          // target. Grant that profile + its backing foundation models so the
+          // gpt_group's hosted models resolve instead of 404/403. (gpt-oss-*
+          // still goes through the mantle door and needs no grant here.)
+          `arn:${Aws.PARTITION}:bedrock:*::foundation-model/openai.gpt-*`,
+          `arn:${Aws.PARTITION}:bedrock:*:${Aws.ACCOUNT_ID}:inference-profile/us.openai.gpt-*`,
         ],
       }),
     );
@@ -549,6 +632,9 @@ export class GovernanceGateway extends Construct {
     // ListTagsForResource is granted and is a read. Projects are created out of
     // band by an operator, not by the gateway role, so the connector only ever
     // reads them.
+    //
+    // The resource scope is below, and it is not '*'. Every action granted here
+    // takes a project ARN.
     //
     // To re-derive this list for your account: look up the namespace in the
     // IAM console policy editor for the full action set, then run
@@ -571,10 +657,33 @@ export class GovernanceGateway extends Construct {
           'bedrock-mantle:GetProject',
           'bedrock-mantle:ListTagsForResource',
         ],
-        // The mantle model catalog is service-owned, not an account resource,
-        // so the read and inference actions above have no account-scoped ARN
-        // to name. See the nag suppression in lib/nag-suppressions.ts.
-        resources: ['*'],
+        // Scoped to projects in THIS account and region.
+        //
+        // Correcting an earlier comment here, which said these actions had no
+        // account-scoped ARN to name and granted them on '*'. The IAM service
+        // authorization reference for bedrock-mantle says otherwise: all nine
+        // actions above take `project` as a required resource type, including
+        // ListModels and GetModel, which read the catalog "in a project"
+        // rather than a service-wide catalog. ListTagsForResource accepts
+        // project among its resource types and is used here only for projects.
+        //
+        // On '*' the role could create, cancel and delete inferences in every
+        // project in the account, including projects belonging to unrelated
+        // workloads. Naming project/* in this account and region removes that.
+        // The wildcard that remains is the project id, which has to stay: the
+        // per-user project is opt-in (-c mantleProject=true) and its id is
+        // generated by the service at deploy time, and requests made without a
+        // project resolve to the account's default project. Both must be
+        // reachable, and neither id is known when this policy is written.
+        //
+        // No statement here needs '*'. The only actions in this namespace with
+        // no resource type are GetAccountDataRetention and
+        // PutAccountDataRetention, and neither is granted.
+        //
+        // https://docs.aws.amazon.com/service-authorization/latest/reference/list_bedrock-mantle.html
+        resources: [
+          `arn:${Aws.PARTITION}:bedrock-mantle:${Aws.REGION}:${Aws.ACCOUNT_ID}:project/*`,
+        ],
       }),
     );
     // The gateway invokes the interceptor Lambda on every request. The L2
@@ -593,10 +702,14 @@ export class GovernanceGateway extends Construct {
     // bearer token from the configured issuer; there is no anonymous access.
     // No protocolType is set, which is the shape that accepts both
     // the bedrock-mantle inference target and the bedrock-runtime HTTP
-    // passthrough target on the same gateway. The REQUEST-only interceptor
-    // reads headers (passRequestHeaders) to recover the validated JWT subject;
-    // there is no RESPONSE interceptor, so responses stream to the client and
-    // attribution runs asynchronously off Bedrock model invocation logs.
+    // passthrough target on the same gateway. The interceptor reads headers
+    // (passRequestHeaders) to recover the validated JWT subject.
+    //
+    // Interception points are gateway-wide, not per-target, so the RESPONSE
+    // point needed to meter the mantle door also applies to the
+    // bedrock-runtime passthrough -- which is why response buffering cannot
+    // be limited to just the door that needs it. Splitting the doors across
+    // two gateways is the only way to keep one of them streaming.
     this.gateway = new agentcore.CfnGateway(this, 'Gateway', {
       name: gatewayName,
       description: 'JWT-authorized inference gateway with per-user governance',
@@ -611,12 +724,30 @@ export class GovernanceGateway extends Construct {
       interceptorConfigurations: [
         {
           interceptor: { lambda: { arn: this.interceptor.functionArn } },
-          interceptionPoints: ['REQUEST'],
+          // REQUEST governs admission. RESPONSE settles usage in band, which is
+          // the ONLY way to meter the mantle (`/inference`) door per user.
+          //
+          // AWS writes Bedrock model invocation logs only for the
+          // bedrock-runtime endpoint, so the asynchronous invocation-log pipe
+          // never sees mantle traffic. The mantle endpoint's own billing records
+          // are per-project-per-day, which is what used to force a
+          // bedrock-mantle project per user -- unworkable for an enterprise,
+          // where projects are a limited per-account resource.
+          //
+          // The responses themselves carry the answer: every mantle door
+          // returns a `usage` block (verified live -- Anthropic Messages returns
+          // input_tokens/output_tokens plus the cache counters, OpenAI Chat
+          // Completions returns prompt_tokens/completion_tokens). Reading it
+          // here settles the exact per-request cost against the calling user's
+          // ledger with no project involved.
+          //
+          // Double settlement is not a risk: runtime-door traffic can also be
+          // settled by the invocation-log pipe, and both paths commit through a
+          // conditional put on EVENT#<request_id>, so whichever arrives second
+          // is a no-op.
+          interceptionPoints: ['REQUEST', 'RESPONSE'],
           inputConfiguration: { passRequestHeaders: true },
         },
-        // No RESPONSE interceptor: responses stream directly to the client.
-        // Attribution is handled asynchronously by the attribution Lambda that
-        // reads token counts from Bedrock model invocation logs.
       ],
     });
     this.gateway.node.addDependency(gatewayRole);
@@ -639,6 +770,13 @@ export class GovernanceGateway extends Construct {
     // two doors.
     this.createInferenceTarget(this.gateway);
     this.createPassthroughTarget(this.gateway);
+
+    // Vended gateway observability (CP-16 / REQ-ADMIN-015A telemetry view,
+    // REQ-ADMIN-015B metrics/OTEL export). A bare AgentCore gateway emits
+    // NOTHING to CloudWatch until the log-delivery trio below exists. Gated by
+    // the `observability` context flag (default ON for the demo) so it is
+    // reversible. See ARCHITECTURE.md section 10 and OBSERVABILITY.md.
+    this.addObservability(this.gateway);
 
     // Attribution pipeline: Bedrock invocation logs -> subscription filter ->
     // attribution Lambda -> DynamoDB debit. This replaces the inline RESPONSE
@@ -815,6 +953,119 @@ export class GovernanceGateway extends Construct {
       },
     });
     passthroughTarget.node.addDependency(gateway);
+  }
+
+  /**
+   * Vended gateway observability (CP-16). Turn on the AgentCore gateway's OWN
+   * OTEL spans + structured logs delivery to CloudWatch/X-Ray via the CDK
+   * log-delivery trio. This is INFRA only — no interceptor code and no app-side
+   * OTEL SDK is involved. It gives operators two things:
+   *   - a view of telemetry, latency and error trends, and
+   *   - metrics/OTEL export to a downstream sink such as Datadog (vended OTEL
+   *     spans export cleanly).
+   *
+   * Two planes, deliberately separate (ARCHITECTURE.md section 10.1): this is
+   * OPERATIONAL telemetry ("how is the system performing"). It does NOT replace
+   * the CP-11 compliance audit (the content-free usage record delivered to SIEM,
+   * emitted separately by the interceptor's structured decision-log lines).
+   *
+   * A bare gateway emits NOTHING until this trio exists. What it creates:
+   *   - APPLICATION_LOGS: CfnDeliverySource(gateway) -> CfnDeliveryDestination
+   *     (CWL, a /aws/vendedlogs/ log group) -> CfnDelivery. Vended logs carry
+   *     trace_id/span_id and a `routing` block (targetName + resolvedModelId).
+   *   - TRACES: CfnDeliverySource(gateway) -> CfnDeliveryDestination(XRAY) ->
+   *     CfnDelivery. OTEL vended spans (kind:SERVER gateway hop + kind:CLIENT
+   *     target hop) then flow to CloudWatch Transaction Search (aws/spans).
+   *
+   * Reversible: gated behind the `observability` CDK context flag (default ON
+   * for the demo). Disable per deploy with `-c observability=false`; traces
+   * alone can be turned off with `-c observabilityTraces=false`.
+   *
+   * GOTCHAS (encoded here and in OBSERVABILITY.md):
+   *   - The log group name MUST start with `/aws/vendedlogs/` or delivery fails.
+   *   - Delivery depends on the gateway existing (explicit node dependency).
+   *   - TRACES silently produce no spans unless account-level CloudWatch
+   *     Transaction Search is ACTIVE — a documented deploy prerequisite, NOT
+   *     something CDK can enable here.
+   *   - Spans lag logs by ~1-2 min; logs land in seconds. Treat logs as the
+   *     primary interactive signal, spans as async enrichment.
+   */
+  private addObservability(gateway: agentcore.CfnGateway): void {
+    // Default ON for the demo; `-c observability=false` turns the whole trio
+    // off and the gateway reverts to emitting nothing.
+    const enabledCtx = this.node.tryGetContext('observability');
+    const enabled = enabledCtx === undefined || enabledCtx === true || enabledCtx === 'true';
+    if (!enabled) {
+      return;
+    }
+    // Traces sub-gate: default ON, `-c observabilityTraces=false` keeps
+    // APPLICATION_LOGS but drops the TRACES->XRAY delivery (e.g. when
+    // Transaction Search is not ACTIVE in the target account yet).
+    const tracesCtx = this.node.tryGetContext('observabilityTraces');
+    const enableTraces =
+      tracesCtx === undefined || tracesCtx === true || tracesCtx === 'true';
+
+    const name = `per-user-governance${this.suffix}`;
+    const gatewayArn = gateway.attrGatewayArn;
+
+    // Vended-logs group. The name MUST start with /aws/vendedlogs/ or the
+    // CfnDelivery to a CWL destination fails at deploy time. The gateway id is
+    // resolved at deploy time (a token here), so the group name is built from
+    // it rather than hard-coded.
+    const vendedLogGroupName =
+      `/aws/vendedlogs/bedrock-agentcore/gateway/APPLICATION_LOGS/${gateway.attrGatewayIdentifier}`;
+    const vendedLogGroup = new logs.LogGroup(this, 'GatewayVendedLogs', {
+      logGroupName: vendedLogGroupName,
+      retention: logs.RetentionDays.ONE_MONTH,
+      // Sample posture: telemetry is disposable, so tear down on destroy.
+      removalPolicy: RemovalPolicy.DESTROY,
+    });
+    this.vendedLogGroupName = vendedLogGroupName;
+
+    // --- APPLICATION_LOGS: source(gateway) -> CWL destination -> delivery ---
+    const logsSource = new logs.CfnDeliverySource(this, 'GatewayLogsSource', {
+      name: `${name}-logs-source`,
+      logType: 'APPLICATION_LOGS',
+      resourceArn: gatewayArn,
+    });
+    logsSource.node.addDependency(gateway);
+    const logsDest = new logs.CfnDeliveryDestination(this, 'GatewayLogsDestination', {
+      name: `${name}-logs-destination`,
+      // CWL destination -> the /aws/vendedlogs/ CloudWatch Logs group.
+      deliveryDestinationType: 'CWL',
+      destinationResourceArn: vendedLogGroup.logGroupArn,
+    });
+    const logsDelivery = new logs.CfnDelivery(this, 'GatewayLogsDelivery', {
+      deliverySourceName: logsSource.name,
+      deliveryDestinationArn: logsDest.attrArn,
+    });
+    logsDelivery.node.addDependency(logsSource);
+    logsDelivery.node.addDependency(logsDest);
+
+    // --- TRACES: source(gateway) -> XRAY destination -> delivery ---
+    // XRAY delivery needs account-level CloudWatch Transaction Search ACTIVE
+    // (documented prerequisite; not enabled from CDK). Without it the delivery
+    // is created but silently yields no spans.
+    if (enableTraces) {
+      const tracesSource = new logs.CfnDeliverySource(this, 'GatewayTracesSource', {
+        name: `${name}-traces-source`,
+        logType: 'TRACES',
+        resourceArn: gatewayArn,
+      });
+      tracesSource.node.addDependency(gateway);
+      const tracesDest = new logs.CfnDeliveryDestination(this, 'GatewayTracesDestination', {
+        name: `${name}-traces-destination`,
+        // XRAY destination -> spans flow to CloudWatch Transaction Search
+        // (aws/spans). No destinationResourceArn for the XRAY type.
+        deliveryDestinationType: 'XRAY',
+      });
+      const tracesDelivery = new logs.CfnDelivery(this, 'GatewayTracesDelivery', {
+        deliverySourceName: tracesSource.name,
+        deliveryDestinationArn: tracesDest.attrArn,
+      });
+      tracesDelivery.node.addDependency(tracesSource);
+      tracesDelivery.node.addDependency(tracesDest);
+    }
   }
 
   /**
