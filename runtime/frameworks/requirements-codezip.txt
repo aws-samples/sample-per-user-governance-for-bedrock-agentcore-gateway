@@ -41,7 +41,7 @@ jmespath==1.1.0
 jsonschema-specifications==2025.9.1
 jsonschema==4.26.0
 mcp-types==2.1.1
-mcp==2.1.1
+mcp==1.30.0
 openai==2.54.0
 opentelemetry-api==1.44.0
 opentelemetry-distro==0.65b0
